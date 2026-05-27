@@ -14081,7 +14081,6 @@ class GatewayRunner(GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
                     provider_sort=pr.get("sort"),
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
-                    skip_user_profile=skip_user_profile,
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
