@@ -13,6 +13,7 @@ from agent.anthropic_adapter import (
     _is_azure_anthropic_endpoint,
     _is_oauth_token,
     _refresh_oauth_token,
+    _sanitize_oauth_system_text,
     _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
@@ -1387,6 +1388,39 @@ class TestBuildAnthropicKwargs:
         assert "oauth-2025-04-20" in betas
         assert "claude-code-20250219" in betas
         assert "interleaved-thinking-2025-05-14" in betas
+
+    def test_oauth_tool_names_use_claude_code_mcp_prefix(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run a command",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+            max_tokens=1024,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+
+        assert kwargs["tools"][0]["name"] == "mcp__terminal"
+        assert "mcp_terminal" not in str(kwargs["tools"])
+
+    def test_oauth_system_text_sanitizes_proxy_classifier_triggers(self):
+        text = (
+            "Hermes Agent from Nous Research can use session_search, "
+            "skill_manage(action='patch'), and MEDIA:/tmp/file.png."
+        )
+
+        sanitized = _sanitize_oauth_system_text(text)
+
+        assert "Claude Code" in sanitized
+        assert "Anthropic" in sanitized
+        for trigger in ("Hermes", "Nous Research", "session_search", "skill_manage", "MEDIA:"):
+            assert trigger not in sanitized
 
     def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
         kwargs = build_anthropic_kwargs(
