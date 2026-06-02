@@ -115,6 +115,17 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+// Send read receipts (blue ticks) back to WhatsApp for inbound messages the
+// bridge accepts and forwards to the gateway. Without this, the agent reads
+// every message but WhatsApp never shows the sender that it was read — the
+// sender sees a perpetual single-grey-tick / unread state. ON by default.
+// Note: Baileys' readMessages() silently downgrades a real 'read' receipt to
+// 'read-self' (no blue tick) unless the account's own privacy setting has
+// readreceipts === 'all', so on connect we also enforce that setting.
+const WHATSAPP_READ_RECEIPTS = !(
+  typeof process.env.WHATSAPP_READ_RECEIPTS === 'string' &&
+  ['0', 'false', 'no', 'off'].includes(process.env.WHATSAPP_READ_RECEIPTS.toLowerCase())
+);
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -456,6 +467,23 @@ async function startSocket() {
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
       }
+      // Ensure read receipts are enabled account-side, otherwise readMessages()
+      // silently downgrades to 'read-self' and the sender never sees blue ticks.
+      if (WHATSAPP_READ_RECEIPTS && !PAIR_ONLY) {
+        (async () => {
+          try {
+            const privacy = await sock.fetchPrivacySettings(true);
+            if (privacy?.readreceipts !== 'all') {
+              await sock.updateReadReceiptsPrivacy('all');
+              console.log(`🔵 Read receipts privacy was '${privacy?.readreceipts}', set to 'all' (blue ticks enabled).`);
+            } else if (WHATSAPP_DEBUG) {
+              console.log("🔵 Read receipts privacy already 'all'.");
+            }
+          } catch (err) {
+            console.error('[bridge] Could not verify/set read-receipts privacy:', err?.message || err);
+          }
+        })();
+      }
       if (PAIR_ONLY) {
         if (!PAIR_JSON) {
           console.log('✅ Pairing complete. Credentials saved.');
@@ -761,6 +789,18 @@ async function startSocket() {
       });
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
+      }
+
+      // Acknowledge the message as read (blue ticks). readMessages() internally
+      // drops fromMe keys via aggregateMessageKeysNotFromMe, so our own echo
+      // messages won't generate receipts even if one slips through. Fire and
+      // forget — never block the upsert handler or fail it on receipt errors.
+      if (WHATSAPP_READ_RECEIPTS && !msg.key.fromMe && !event.isStatus) {
+        sock.readMessages([msg.key]).catch((err) => {
+          if (WHATSAPP_DEBUG) {
+            console.error('[bridge] readMessages failed:', err?.message || err);
+          }
+        });
       }
     }
   });
