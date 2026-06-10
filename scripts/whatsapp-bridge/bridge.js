@@ -1117,6 +1117,22 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Read-only diagnostic: list every group the account participates in, with subject.
+app.get('/groups', async (req, res) => {
+  if (!sock) return res.status(503).json({ error: 'not_connected' });
+  try {
+    const all = await sock.groupFetchAllParticipating();
+    const groups = Object.values(all).map(g => ({
+      id: g.id,
+      subject: g.subject,
+      participants: Array.isArray(g.participants) ? g.participants.length : 0,
+    }));
+    res.json({ count: groups.length, groups });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
 // Start
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
