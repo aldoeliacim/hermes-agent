@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -53,21 +54,107 @@ def _canonical_silence_candidates(text: str) -> tuple[str, ...]:
     return (exact, fallback)
 
 
-def is_intentional_silence_response(response: Any) -> bool:
-    """Return True only when ``response`` is exactly a silence marker.
+# Leaked reply-gate reasoning detection.
+#
+# Failure observed 2026-06-12 (ProgramaLoL WhatsApp group): the model decided
+# to stay silent on ambient human-to-human banter, but instead of emitting the
+# canonical silence token (or empty text) it wrote its reply-gate REASONING as
+# the turn's final response — "This is human-to-human group banter ... nobody
+# addressed me ... Per the reply gate, I stay silent here. No message sent." —
+# which the exact-marker filter does not match, so it shipped to the group as a
+# 185-char message. This is the silence-sentinel drift problem: an exact-token
+# contract is unreliable, so the delivery boundary needs a backstop that
+# recognizes the model narrating a stay-silent DECISION and suppresses it.
+#
+# Tell: the leak is the model's internal chain-of-thought (English, present-tense
+# decision-log voice) — it appears even in a Spanish chat because reasoning is in
+# English.
+#
+# Precision discipline (must NOT eat legit messages, incl. an owner-DM answer to
+# "why didn't you reply?" that explains the mechanism):
+#   - suppression ALWAYS requires a FIRST-PERSON stay-silent decision signal
+#     (Tier A: "I stay silent", "No message sent", "nobody addressed me", ...).
+#     Descriptive terms alone (Tier B: "human-to-human", "obvious recipient")
+#     and the bare term "reply gate" NEVER suppress on their own — that's how an
+#     owner explanation of the mechanism stays deliverable.
+#   - suppress when: two independent Tier-A statements (a decision-log), OR
+#     "reply gate" jargon co-occurs with >=1 Tier-A statement, OR one Tier-A
+#     statement backed by >=3 total signals.
+#   - only applies to short messages (a long genuine reply is never the bug).
+_REPLY_GATE_JARGON_RE = re.compile(r"\breply[\s\-]?gate\b", re.IGNORECASE)
 
-    Substantive prose that merely mentions ``NO_REPLY`` or ``[SILENT]`` must be
-    delivered normally.  A blank response is also not silence; blank output is
-    handled by the empty-response failure path.
+# Tier A — first-person / definitive stay-silent decision (the leaked CoT voice).
+_SILENCE_DECISION_TIER_A_RES = (
+    re.compile(r"\b(?:i|i'?ll|i\s+will)\s+(?:stay|remain)\s+(?:silent|quiet)\b", re.IGNORECASE),
+    re.compile(r"\bno\s+message\s+(?:sent|is\s+sent)\b", re.IGNORECASE),
+    re.compile(r"\bsent\s+no\s+message\b", re.IGNORECASE),
+    re.compile(r"\b(?:nobody|no\s+one)\s+addressed\s+me\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+addressed\s+to\s+me\b", re.IGNORECASE),
+    re.compile(r"\bwas\s*n'?t\s+addressed\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+)?(?:do\s+not|don'?t|won'?t|will\s+not)\s+reply\b", re.IGNORECASE),
+    re.compile(r"\bi\s+stay\s+silent\b", re.IGNORECASE),
+)
+
+# Tier B — contextual support; never decisive on its own.
+_SILENCE_DECISION_TIER_B_RES = (
+    re.compile(r"\bhuman[\s\-]to[\s\-]human\b", re.IGNORECASE),
+    re.compile(r"\bobvious\s+recipient\b", re.IGNORECASE),
+    re.compile(r"\bstay(?:ing)?\s+silent\b", re.IGNORECASE),
+    re.compile(r"\bremain\s+silent\b", re.IGNORECASE),
+    re.compile(r"\bambient\s+(?:conversation|banter|chatter)\b", re.IGNORECASE),
+)
+
+# Only scan short responses — a leaked decision-log is terse. A genuine long
+# message that merely mentions silence is never the bug.
+_SILENCE_NARRATION_MAX_LEN = 800
+
+
+def _is_leaked_silence_narration(text: str) -> bool:
+    """True when `text` is the model narrating a stay-silent decision instead of
+    a real message — high precision so legitimate prose is never suppressed."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _SILENCE_NARRATION_MAX_LEN:
+        return False
+    tier_a = sum(1 for rx in _SILENCE_DECISION_TIER_A_RES if rx.search(stripped))
+    if tier_a == 0:
+        # No first-person stay-silent decision -> not leaked reasoning. An owner
+        # explanation of the mechanism (Tier-B / "reply gate" only) lands here
+        # and is delivered untouched.
+        return False
+    tier_b = sum(1 for rx in _SILENCE_DECISION_TIER_B_RES if rx.search(stripped))
+    has_jargon = bool(_REPLY_GATE_JARGON_RE.search(stripped))
+    return (
+        tier_a >= 2                                 # two decision statements == decision log
+        or (has_jargon and tier_a >= 1)             # mechanism + a decision == leaked CoT
+        or (tier_a >= 1 and tier_a + tier_b >= 3)   # one decision, heavily corroborated
+    )
+
+
+def is_intentional_silence_response(response: Any) -> bool:
+    """Return True when ``response`` is an intentional-silence signal.
+
+    Two cases suppress delivery:
+      1. The whole canonicalized response is an exact silence marker
+         (``NO_REPLY`` / ``[SILENT]`` / ...), tolerant of stray edge
+         punctuation.  Substantive prose that merely mentions a marker is
+         delivered normally; a blank response is the empty-response failure
+         path, not silence.
+      2. The model narrated its stay-silent DECISION instead of emitting the
+         token (leaked reply-gate reasoning) — a high-precision backstop, see
+         ``_is_leaked_silence_narration``.
     """
     if not isinstance(response, str):
         return False
     stripped = response.strip()
     if not stripped:
         return False
-    if len(stripped) > 64:
-        return False
-    return any(candidate in LIVE_GATEWAY_SILENT_MARKERS for candidate in _canonical_silence_candidates(stripped))
+    if len(stripped) <= 64 and any(
+        candidate in LIVE_GATEWAY_SILENT_MARKERS for candidate in _canonical_silence_candidates(stripped)
+    ):
+        return True
+    if _is_leaked_silence_narration(stripped):
+        return True
+    return False
 
 
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
