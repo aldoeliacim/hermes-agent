@@ -22,6 +22,28 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+def _is_whatsapp_broadcast_or_status_id(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    return raw == "status@s.whatsapp.net" or raw.endswith("@broadcast")
+
+
+def _is_whatsapp_status_alias(value: Any) -> bool:
+    """Return True only for WhatsApp *status/story* pseudo-chat aliases.
+
+    Distinct from :func:`_is_whatsapp_broadcast_or_status_id`: this matches
+    ONLY the status/story aliases (``status@s.whatsapp.net`` /
+    ``status@broadcast``), NOT generic broadcast-list JIDs (``<num>@broadcast``).
+
+    A real DM delivered through a WhatsApp broadcast list is routed through the
+    human sender and stores the broadcast JID as ``chat_id_alt`` (see the
+    adapter's ``source_chat_id_alt`` handling). Those are valid, deliverable
+    sessions and must NOT be suspended on hydration just because their alias
+    ends with ``@broadcast``. Only true status aliases are non-deliverable.
+    """
+    raw = str(value or "").strip().lower()
+    return raw in {"status@s.whatsapp.net", "status@broadcast"}
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
@@ -451,6 +473,17 @@ def build_session_context_prompt(
         if redact_pii:
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")
+
+    if context.source.platform != Platform.LOCAL:
+        lines.append("")
+        lines.append(
+            "**Identity safety:** The Current Session Context above is authoritative "
+            "for who is speaking in this chat. Long-term memory/user-profile blocks "
+            "may describe the agent owner or other known people; do NOT treat "
+            "those blocks as the current speaker's identity unless they explicitly "
+            "match this Source/User. Do not address the current speaker as the owner "
+            "unless the Current Session Context says the current User is the owner."
+        )
 
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
@@ -1026,10 +1059,48 @@ class SessionStore:
                         )
                         continue
                     try:
-                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                        origin_data = entry_data.get("origin")
+                        if not isinstance(origin_data, dict):
+                            origin_data = {}
+                        if (
+                            origin_data.get("platform") == Platform.WHATSAPP.value
+                            and _is_whatsapp_broadcast_or_status_id(origin_data.get("chat_id"))
+                        ):
+                            # WhatsApp status/story and broadcast-list IDs are
+                            # inbound-only aliases, not real delivery/session
+                            # lanes. Keeping them active lets later messages
+                            # resume polluted transcripts or exposes bad
+                            # targets via channel_directory.
+                            logger.info("Dropping non-deliverable WhatsApp session key %s", key)
+                            continue
+                        entry = SessionEntry.from_dict(entry_data)
+                        if (
+                            entry.origin
+                            and entry.origin.platform == Platform.WHATSAPP
+                            and _is_whatsapp_status_alias(entry.origin.chat_id_alt)
+                        ):
+                            # Existing sessions created before the adapter fix
+                            # may have processed a *status/story* as if it were
+                            # a DM. Force a clean slate next time that human
+                            # sends a real message; do not resume the status
+                            # transcript.
+                            #
+                            # IMPORTANT: only true status aliases
+                            # (status@s.whatsapp.net / status@broadcast) are
+                            # suspended here. A real DM delivered via a
+                            # broadcast list is routed through the human sender
+                            # and stores the generic ``<num>@broadcast`` JID as
+                            # ``chat_id_alt`` — that is a valid, deliverable
+                            # session and must NOT be suspended (#21758 review).
+                            entry.suspended = True
+                            entry.resume_pending = False
+                            entry.resume_reason = None
+                            entry.last_resume_marked_at = None
+                        self._entries[key] = entry
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
+                        continue
                 if imported and db_had_entries:
                     logger.info(
                         "gateway.session: imported %d legacy sessions.json "

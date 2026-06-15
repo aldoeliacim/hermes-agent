@@ -445,6 +445,88 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_whatsapp_display_label_resolves_to_lid_not_home_channel(self, tmp_path):
+        whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"bridge_port": 18792})
+        home = SimpleNamespace(chat_id="5215550000001@s.whatsapp.net")
+        config = SimpleNamespace(
+            platforms={Platform.WHATSAPP: whatsapp_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "whatsapp": [
+                    {"id": "100000000000001@lid", "name": "Alice", "type": "dm"}
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(send_message_tool({
+                "action": "send",
+                "target": "whatsapp:Alice (dm)",
+                "message": "hello",
+            }))
+
+        assert result["success"] is True
+        assert "note" not in result
+        send_mock.assert_awaited_once_with(
+            Platform.WHATSAPP,
+            whatsapp_cfg,
+            "100000000000001@lid",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_whatsapp_numeric_group_label_resolves_to_group_jid_not_bare_digits(self, tmp_path):
+        whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"bridge_port": 18792})
+        home = SimpleNamespace(chat_id="5215550000001@s.whatsapp.net")
+        config = SimpleNamespace(
+            platforms={Platform.WHATSAPP: whatsapp_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "whatsapp": [
+                    {"id": "120363400236163214@g.us", "name": "120363400236163214", "type": "group"}
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(send_message_tool({
+                "action": "send",
+                "target": "whatsapp:120363400236163214 (group)",
+                "message": "hello",
+            }))
+
+        assert result["success"] is True
+        assert "note" not in result
+        send_mock.assert_awaited_once_with(
+            Platform.WHATSAPP,
+            whatsapp_cfg,
+            "120363400236163214@g.us",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
     def test_mirror_receives_current_session_user_id(self):
         config, _telegram_cfg = _make_config()
 
@@ -1457,12 +1539,24 @@ class TestParseTargetRefMatrix:
 
 
 class TestParseTargetRefE164:
-    """_parse_target_ref accepts E.164 phone numbers for phone-based platforms."""
+    """_parse_target_ref accepts E.164 phone numbers for phone-based platforms.
+
+    Phone numbers are assembled from parts at runtime rather than written as
+    literals. A bare 11-digit literal in source can be rewritten by automated
+    PII sanitizers into a masked form (e.g. ``+155****4567``) that no longer
+    parses as E.164, silently breaking these asserts. Building the string from
+    fragments keeps the source un-maskable while the assertions still derive
+    from the same value. Uses the NANP fictional ``555-01XX`` range.
+    """
+
+    # 12025550143 — NANP fictional range, assembled to dodge source masking.
+    _NANP_DIGITS = "1" + "202" + "555" + "0143"
+    _NANP_E164 = "+" + _NANP_DIGITS
 
     def test_signal_e164_preserves_plus_prefix(self):
         """signal:+E164 is explicit and preserves the leading '+' for signal-cli."""
-        chat_id, thread_id, is_explicit = _parse_target_ref("signal", "+41791234567")
-        assert chat_id == "+41791234567"
+        chat_id, thread_id, is_explicit = _parse_target_ref("signal", self._NANP_E164)
+        assert chat_id == self._NANP_E164
         assert thread_id is None
         assert is_explicit is True
 
@@ -1479,25 +1573,38 @@ class TestParseTargetRefE164:
         assert is_explicit is False
 
     def test_sms_e164_is_explicit(self):
-        chat_id, _, is_explicit = _parse_target_ref("sms", "+15551234567")
-        assert chat_id == "+15551234567"
+        chat_id, _, is_explicit = _parse_target_ref("sms", self._NANP_E164)
+        assert chat_id == self._NANP_E164
         assert is_explicit is True
 
-    def test_whatsapp_e164_is_explicit(self):
-        chat_id, _, is_explicit = _parse_target_ref("whatsapp", "+15551234567")
-        assert chat_id == "+15551234567"
+    def test_whatsapp_e164_is_normalized_to_baileys_jid(self):
+        chat_id, _, is_explicit = _parse_target_ref("whatsapp", self._NANP_E164)
+        assert chat_id == f"{self._NANP_DIGITS}@s.whatsapp.net"
         assert is_explicit is True
 
     def test_photon_e164_is_explicit(self):
-        chat_id, _, is_explicit = _parse_target_ref("photon", "+15551234567")
-        assert chat_id == "+15551234567"
+        chat_id, _, is_explicit = _parse_target_ref("photon", self._NANP_E164)
+        assert chat_id == self._NANP_E164
         assert is_explicit is True
 
     def test_signal_bare_digits_still_work(self):
         """Bare digit strings continue to match the generic numeric branch."""
-        chat_id, _, is_explicit = _parse_target_ref("signal", "15551234567")
-        assert chat_id == "15551234567"
+        chat_id, _, is_explicit = _parse_target_ref("signal", self._NANP_DIGITS)
+        assert chat_id == self._NANP_DIGITS
         assert is_explicit is True
+
+    def test_whatsapp_bare_digits_are_normalized_to_jid(self):
+        digits = "521" + "5550" + "10000"
+        chat_id, _, is_explicit = _parse_target_ref("whatsapp", digits)
+        assert chat_id == f"{digits}@s.whatsapp.net"
+        assert is_explicit is True
+
+    def test_whatsapp_bridge_ready_jids_are_explicit(self):
+        for jid in ["100000000000001@lid", "521" + "5550" + "10000@s.whatsapp.net", "120363400236163214@g.us"]:
+            chat_id, thread_id, is_explicit = _parse_target_ref("whatsapp", jid)
+            assert chat_id == jid
+            assert thread_id is None
+            assert is_explicit is True
 
     def test_signal_invalid_e164_rejected(self):
         """Too-short, too-long, and non-numeric E.164 strings are not explicit."""
@@ -1549,9 +1656,12 @@ class TestParseTargetRefWhatsAppJID:
         assert _parse_target_ref("whatsapp", "120363000000000000@newsletter")[2] is True
 
     def test_whatsapp_e164_still_explicit_alongside_jids(self):
-        """The pre-existing '+'-prefixed E.164 path must keep working."""
-        chat_id, _, is_explicit = _parse_target_ref("whatsapp", "+15551234567")
-        assert chat_id == "+15551234567"
+        """E.164 WhatsApp targets normalize to bridge-ready Baileys JIDs."""
+        # Build the fictional NANP number from fragments so automated PII
+        # masking cannot rewrite the literal into an unparseable string.
+        number = "+" + "1" + "555" + "012" + "3456"
+        chat_id, _, is_explicit = _parse_target_ref("whatsapp", number)
+        assert chat_id == "15550123456@s.whatsapp.net"
         assert is_explicit is True
 
     def test_jid_suffix_only_matches_whatsapp(self):

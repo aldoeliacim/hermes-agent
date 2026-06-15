@@ -347,11 +347,26 @@ class WhatsAppBehaviorMixin:
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         chat_id_raw = str(data.get("chatId") or "")
+        sender_id_raw = str(data.get("senderId") or data.get("from") or "")
         # WhatsApp uses pseudo-chats for Status updates (Stories) and
         # Channel/Newsletter broadcasts. These are not real conversations
         # and the agent should never reply to them — even in self-chat mode
         # where the bridge may surface them as "fromMe" events.
-        if self._is_broadcast_chat(chat_id_raw):
+        #
+        # Exception: generic broadcast-list JIDs (for example
+        # ``1778109128@broadcast``) are real DMs delivered through a broadcast
+        # list. The bridge also supplies the human sender JID, and
+        # ``_build_message_event`` routes replies to that sender while keeping
+        # the broadcast JID as an alias for lookup/debugging.
+        cid = chat_id_raw.strip().lower()
+        is_unaddressable = cid in {"status@broadcast", "status@s.whatsapp.net"} or cid.endswith("@newsletter")
+        is_broadcast_list_dm = (
+            cid.endswith("@broadcast")
+            and not is_unaddressable
+            and sender_id_raw
+            and not sender_id_raw.strip().lower().endswith("@broadcast")
+        )
+        if is_unaddressable or (self._is_broadcast_chat(chat_id_raw) and not is_broadcast_list_dm):
             return False
         is_group = data.get("isGroup", False)
         if is_group:

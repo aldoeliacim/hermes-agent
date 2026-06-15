@@ -1354,10 +1354,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Determine chat type
             is_group = data.get("isGroup", False)
             chat_type = "group" if is_group else "dm"
-            
+
+            # Broadcast-list DMs arrive with chatId like
+            # ``1778109128@broadcast`` and senderId set to the human's JID/LID.
+            # Replies to the broadcast JID are not deliverable, so route the
+            # session through the sender while retaining the broadcast JID as an
+            # alias for channel-directory/session lookup.
+            raw_chat_id = str(data.get("chatId") or "")
+            sender_id = str(data.get("senderId") or "")
+            source_chat_id = raw_chat_id
+            source_chat_id_alt = None
+            if (
+                not is_group
+                and raw_chat_id.endswith("@broadcast")
+                and sender_id
+                and not sender_id.endswith("@broadcast")
+            ):
+                source_chat_id = sender_id
+                source_chat_id_alt = raw_chat_id
+
             # Build source
             source = self.build_source(
-                chat_id=data.get("chatId", ""),
+                chat_id=source_chat_id,
+                chat_id_alt=source_chat_id_alt,
                 chat_name=data.get("chatName"),
                 chat_type=chat_type,
                 user_id=data.get("senderId"),
