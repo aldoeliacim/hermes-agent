@@ -42,10 +42,17 @@ from hermes_time import now as _hermes_now
 from utils import atomic_replace
 
 try:
-    from croniter import croniter
+    from croniter import croniter as _croniter_factory
     HAS_CRONITER = True
 except ImportError:
+    _croniter_factory = None
     HAS_CRONITER = False
+
+
+def _new_croniter(*args, **kwargs):
+    if _croniter_factory is None:
+        raise ImportError("croniter is not installed")
+    return _croniter_factory(*args, **kwargs)
 
 # =============================================================================
 # Configuration
@@ -521,7 +528,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             raise ValueError("Cron expressions require 'croniter' package. Install with: pip install croniter")
         # Validate cron expression
         try:
-            croniter(schedule)
+            _new_croniter(schedule)
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
         return {
@@ -675,7 +682,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
         if expr:
             try:
                 now = _hermes_now()
-                cron = croniter(expr, now)
+                cron = _new_croniter(expr, now)
                 first = cron.get_next(datetime)
                 second = cron.get_next(datetime)
                 period_seconds = int((second - first).total_seconds())
@@ -742,7 +749,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
-        cron = croniter(expr, base_time)
+        cron = _new_croniter(expr, base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()
 
@@ -1680,6 +1687,14 @@ def advance_next_run(job_id: str) -> bool:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
                     return False
+                scheduled_run_at = job.get("next_run_at")
+                if scheduled_run_at:
+                    try:
+                        job["last_scheduled_run_at"] = _ensure_aware(
+                            datetime.fromisoformat(scheduled_run_at)
+                        ).isoformat()
+                    except Exception:
+                        job["last_scheduled_run_at"] = scheduled_run_at
                 now = _hermes_now().isoformat()
                 new_next = compute_next_run(job["schedule"], now)
                 if new_next and new_next != job.get("next_run_at"):
@@ -1759,6 +1774,32 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
             return True
+        return False
+
+
+def _cron_runs_at_most_once_per_local_day(schedule: Dict[str, Any], reference: datetime) -> bool:
+    """Return True for cron schedules that cannot fire twice on one local date.
+
+    This is intentionally derived from croniter rather than from brittle field
+    parsing.  It catches daily/weekly/monthly schedules while leaving schedules
+    such as ``0 */3 * * *`` or ``0 13,19,1 * * *`` alone.
+    """
+    if schedule.get("kind") != "cron" or not HAS_CRONITER:
+        return False
+
+    try:
+        cron = _new_croniter(schedule["expr"], reference - timedelta(days=1))
+        seen_dates = set()
+        for _ in range(8):
+            occurrence = cron.get_next(datetime)
+            local_date = occurrence.astimezone(reference.tzinfo).date()
+            if local_date in seen_dates:
+                return False
+            seen_dates.add(local_date)
+            if len(seen_dates) >= 3:
+                return True
+        return True
+    except Exception:
         return False
 
 
@@ -2101,6 +2142,40 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             rj["run_claim"] = claim
                             needs_save = True
                             break
+
+                # Same-day duplicate-cron guard (timezone-change fix): a
+                # once-per-local-day cron whose old next_run_at was computed in
+                # a different timezone can appear due a second time on the same
+                # local date after the tz change. Skip the duplicate and advance.
+                if kind == "cron" and _cron_runs_at_most_once_per_local_day(schedule, next_run_dt):
+                    last_scheduled_run_at = job.get("last_scheduled_run_at")
+                    if last_scheduled_run_at:
+                        last_scheduled_dt = _ensure_aware(datetime.fromisoformat(last_scheduled_run_at))
+                        if last_scheduled_dt.date() == next_run_dt.date():
+                            # A single-fire-per-day cron already had a scheduled
+                            # run on this local date.  This can happen after
+                            # changing Hermes timezone: an old UTC next_run_at
+                            # fires in the morning, then the same cron expression
+                            # is reinterpreted in local time and appears due again
+                            # later that day.  Use the scheduler-only timestamp so
+                            # a manual `cron run` earlier in the day does not
+                            # suppress the real scheduled run.
+                            new_next = compute_next_run(schedule, next_run_dt.isoformat())
+                            if new_next:
+                                logger.info(
+                                    "Job '%s' already had a scheduled run on %s; "
+                                    "skipping duplicate same-day cron occurrence "
+                                    "and advancing to %s",
+                                    job.get("name", job["id"]),
+                                    last_scheduled_dt.date(),
+                                    new_next,
+                                )
+                                for rj in raw_jobs:
+                                    if rj["id"] == job["id"]:
+                                        rj["next_run_at"] = new_next
+                                        needs_save = True
+                                        break
+                                continue
 
                 due.append(job)
         except Exception:
