@@ -383,3 +383,94 @@ class TestCronTimezone:
 
         next_run = datetime.fromisoformat(job["next_run_at"])
         assert next_run.tzinfo is not None
+
+    def test_get_due_jobs_skips_duplicate_single_daily_cron_after_timezone_change(self, tmp_path, monkeypatch):
+        """A daily cron must not fire twice on one local date after TZ migration.
+
+        Regression from a live job: an old UTC next_run_at fired at 09:00 CDMX;
+        after Hermes timezone was set to America/Mexico_City, the same cron
+        expression (`0 15 * * *`) was recomputed as 15:00 CDMX and fired again
+        the same day.
+        """
+        import cron.jobs as jobs_module
+        monkeypatch.setattr(jobs_module, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs_module, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs_module, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+        tz = ZoneInfo("America/Mexico_City")
+        os.environ["HERMES_TIMEZONE"] = "America/Mexico_City"
+        _reset_hermes_time_cache()
+        monkeypatch.setattr(
+            jobs_module,
+            "_hermes_now",
+            lambda: datetime(2026, 6, 15, 15, 0, 1, tzinfo=tz),
+        )
+
+        from cron.jobs import create_job, get_due_jobs, load_jobs, save_jobs
+
+        create_job(prompt="Daily job", schedule="0 15 * * *")
+        jobs = load_jobs()
+        jobs[0]["last_run_at"] = "2026-06-15T09:02:13-06:00"
+        jobs[0]["last_scheduled_run_at"] = "2026-06-15T09:00:00-06:00"
+        jobs[0]["next_run_at"] = "2026-06-15T15:00:00-06:00"
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+
+        updated = load_jobs()[0]
+        assert updated["next_run_at"] == "2026-06-16T15:00:00-06:00"
+
+    def test_get_due_jobs_allows_manual_run_before_daily_cron(self, tmp_path, monkeypatch):
+        """A manual run earlier today must not suppress the scheduled run."""
+        import cron.jobs as jobs_module
+        monkeypatch.setattr(jobs_module, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs_module, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs_module, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+        tz = ZoneInfo("America/Mexico_City")
+        os.environ["HERMES_TIMEZONE"] = "America/Mexico_City"
+        _reset_hermes_time_cache()
+        monkeypatch.setattr(
+            jobs_module,
+            "_hermes_now",
+            lambda: datetime(2026, 6, 15, 15, 0, 1, tzinfo=tz),
+        )
+
+        from cron.jobs import create_job, get_due_jobs, load_jobs, save_jobs
+
+        create_job(prompt="Daily job", schedule="0 15 * * *")
+        jobs = load_jobs()
+        jobs[0]["last_run_at"] = "2026-06-15T09:02:13-06:00"
+        jobs[0].pop("last_scheduled_run_at", None)
+        jobs[0]["next_run_at"] = "2026-06-15T15:00:00-06:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == [jobs[0]["id"]]
+
+    def test_get_due_jobs_allows_multi_run_cron_same_day(self, tmp_path, monkeypatch):
+        """Same-day guard must not suppress schedules with multiple daily runs."""
+        import cron.jobs as jobs_module
+        monkeypatch.setattr(jobs_module, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs_module, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs_module, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+        tz = ZoneInfo("America/Mexico_City")
+        os.environ["HERMES_TIMEZONE"] = "America/Mexico_City"
+        _reset_hermes_time_cache()
+        monkeypatch.setattr(
+            jobs_module,
+            "_hermes_now",
+            lambda: datetime(2026, 6, 15, 15, 0, 1, tzinfo=tz),
+        )
+
+        from cron.jobs import create_job, get_due_jobs, load_jobs, save_jobs
+
+        create_job(prompt="Multi-run job", schedule="0 9,15 * * *")
+        jobs = load_jobs()
+        jobs[0]["last_run_at"] = "2026-06-15T09:02:13-06:00"
+        jobs[0]["next_run_at"] = "2026-06-15T15:00:00-06:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == [jobs[0]["id"]]
