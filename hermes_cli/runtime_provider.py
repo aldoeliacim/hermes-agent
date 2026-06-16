@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
@@ -159,6 +160,71 @@ def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> 
         configured_mode = None
 
     return configured_mode or detected_mode or "chat_completions"
+
+
+def _format_utc_timestamp(value: Any) -> str:
+    """Format a stored epoch timestamp for credential-pool diagnostics."""
+    if value is None or value == "":
+        return ""
+    try:
+        timestamp = float(value)
+        # OAuth stores sometimes use ms; pool exhaustion timestamps use seconds.
+        if timestamp > 32_503_680_000:
+            timestamp = timestamp / 1000.0
+        return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        text = str(value).strip()
+        return text
+
+
+def _short_error_message(value: Any, *, limit: int = 120) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _credential_pool_unavailable_error(provider: str, pool: CredentialPool) -> str:
+    display_provider = "Anthropic" if provider == "anthropic" else provider
+    try:
+        entries = list(pool.entries())
+    except Exception:
+        entries = []
+    count = len(entries)
+    noun = "credential" if count == 1 else "credentials"
+    message = (
+        f"{display_provider} credential pool has {count} configured {noun}, "
+        "but none are currently available"
+    )
+    details = []
+    for entry in entries[:4]:
+        label = (
+            str(getattr(entry, "label", "") or "").strip()
+            or str(getattr(entry, "id", "") or "").strip()[:8]
+            or "credential"
+        )
+        status = str(getattr(entry, "last_status", "") or "unavailable").strip()
+        reason = (
+            str(getattr(entry, "last_error_reason", "") or "").strip()
+            or str(getattr(entry, "last_error_code", "") or "").strip()
+        )
+        detail = f"{label}: {status}"
+        if reason:
+            detail += f" ({reason})"
+        reset_at = _format_utc_timestamp(getattr(entry, "last_error_reset_at", None))
+        if reset_at:
+            detail += f" until {reset_at}"
+        error_message = _short_error_message(getattr(entry, "last_error_message", ""))
+        if error_message:
+            detail += f" - {error_message}"
+        details.append(detail)
+    if len(entries) > 4:
+        details.append(f"{len(entries) - 4} more")
+    if details:
+        message += ": " + "; ".join(details)
+    if message.endswith((".", "!", "?")):
+        return message
+    return message + "."
 
 
 def _host_derived_api_key(base_url: str) -> str:
@@ -1691,6 +1757,7 @@ def resolve_runtime_provider(
             and not has_runtime_override
         )
 
+    pool_unavailable_error = ""
     try:
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
@@ -1758,6 +1825,8 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
+        if entry is None:
+            pool_unavailable_error = _credential_pool_unavailable_error(provider, pool)
 
     if provider == "nous":
         try:
@@ -1920,6 +1989,12 @@ def resolve_runtime_provider(
             from agent.anthropic_adapter import resolve_anthropic_token
             token = resolve_anthropic_token()
             if not token:
+                if pool_unavailable_error:
+                    raise AuthError(
+                        pool_unavailable_error,
+                        provider="anthropic",
+                        code="credential_pool_unavailable",
+                    )
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."

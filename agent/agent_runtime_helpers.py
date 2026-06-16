@@ -903,6 +903,21 @@ def recover_with_credential_pool(
             if not _is_xai_auth_failure:
                 is_entitlement = True
         if is_entitlement:
+            rotate_status = status_code if status_code is not None else 403
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+            )
+            if next_entry is not None:
+                _ra().logger.info(
+                    "Credential %s — entitlement-shaped 403 from %s; "
+                    "rotated to pool entry %s instead of refreshing the same account.",
+                    rotate_status,
+                    agent.provider or "provider",
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, False
             _ra().logger.info(
                 "Credential %s — entitlement-shaped 403 from %s; "
                 "skipping pool refresh (account lacks subscription, "

@@ -313,7 +313,7 @@ def _run_agent(
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
     from hermes_cli.models import detect_provider_for_model
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import AuthError, resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
@@ -372,11 +372,43 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
-    )
+    fallback_chain = get_fallback_chain(cfg)
+    try:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url_from_alias,
+        )
+    except AuthError:
+        fallback_runtime = None
+        fallback_provider = ""
+        fallback_model = ""
+        # Oneshot bypasses HermesCLI._ensure_runtime_credentials(), so it must
+        # perform the same pre-agent fallback here. Otherwise an unavailable
+        # primary credential pool (rate limit, org-policy OAuth denial, etc.)
+        # aborts before AIAgent's normal retry/fallback machinery exists.
+        for entry in fallback_chain:
+            if not isinstance(entry, dict):
+                continue
+            candidate_provider = str(entry.get("provider") or "").strip().lower()
+            candidate_model = str(entry.get("model") or "").strip()
+            if not candidate_provider or not candidate_model:
+                continue
+            try:
+                fallback_runtime = resolve_runtime_provider(
+                    requested=candidate_provider,
+                    target_model=candidate_model,
+                )
+            except AuthError:
+                continue
+            fallback_provider = candidate_provider
+            fallback_model = candidate_model
+            break
+        if fallback_runtime is None:
+            raise
+        runtime = fallback_runtime
+        effective_provider = fallback_provider
+        effective_model = fallback_model
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
@@ -386,9 +418,6 @@ def _run_agent(
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     session_db = _create_session_db_for_oneshot()
-    # Read the effective fallback chain from profile config so oneshot workers
-    # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),
@@ -401,7 +430,7 @@ def _run_agent(
         platform="cli",
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
-        fallback_model=_fb or None,
+        fallback_model=fallback_chain or None,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction

@@ -76,6 +76,10 @@ _TERMINAL_AUTH_REASONS = frozenset({
     "refresh_token_reused", # Single-use refresh token consumed by another process
 })
 
+_ANTHROPIC_TERMINAL_403_MARKERS = (
+    "oauth authentication is currently not allowed for this organization",
+)
+
 # How long a DEAD manual credential is preserved before being pruned.
 # Manual entries (``manual:*``) are independent credentials with no singleton
 # to re-seed from, so pruning them after a quiet window cleans up dead state
@@ -605,15 +609,20 @@ class CredentialPool:
     ) -> bool:
         """Detect upstream-permanent OAuth failures that won't recover on TTL.
 
-        Only fires for 401 responses whose error code/reason matches a known
+        Fires for 401 responses whose error code/reason matches a known
         terminal OAuth state (token_invalidated, token_revoked, invalid_grant,
-        etc.).  Distinguishes permanent failures from transient ones like
+        etc.), plus provider-specific policy denials that cannot recover by
+        waiting.  Distinguishes permanent failures from transient ones like
         token_expired (refreshable) or generic 401 without a specific reason
         (could be a server-side glitch worth retrying).
 
-        Returns False for non-401 status codes — 429 rate limits and 402
-        billing failures are transient by nature and should keep TTL semantics.
+        429 rate limits and 402 billing failures are transient by nature and
+        should keep TTL semantics.
         """
+        if self.provider == "anthropic" and status_code == 403:
+            message = str(normalized_error.get("message") or "").strip().lower()
+            if any(marker in message for marker in _ANTHROPIC_TERMINAL_403_MARKERS):
+                return True
         if status_code != 401:
             return False
         reason = normalized_error.get("reason")
@@ -1557,6 +1566,7 @@ class CredentialPool:
             # Increment usage counter so subsequent selections distribute load
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
+            self._persist()
             self._current_id = entry.id
             return updated
 

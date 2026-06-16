@@ -444,6 +444,59 @@ def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     assert persisted["last_error_reason"] == "token_invalidated"
 
 
+def test_anthropic_org_oauth_policy_403_marks_credential_dead(tmp_path, monkeypatch):
+    """Anthropic org policy denials do not recover by waiting for a TTL."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-denied",
+                        "label": "org-blocked",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:claude_code",
+                        "access_token": "denied-at",
+                    },
+                    {
+                        "id": "cred-ok",
+                        "label": "healthy",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:claude_code",
+                        "access_token": "healthy-at",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool, STATUS_DEAD
+
+    pool = load_pool("anthropic")
+    assert pool.select().id == "cred-denied"
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=403,
+        error_context={
+            "reason": "permission_error",
+            "message": "OAuth authentication is currently not allowed for this organization.",
+        },
+    )
+
+    assert next_entry is not None
+    assert next_entry.id == "cred-ok"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert persisted["last_status"] == STATUS_DEAD
+    assert persisted["last_error_code"] == 403
+    assert persisted["last_error_reason"] == "permission_error"
+
+
 def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatch):
     """A DEAD credential must stay excluded regardless of how much time passes.
 
@@ -1929,6 +1982,13 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
+    stored = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    stored_light = next(
+        item
+        for item in stored["credential_pool"]["openrouter"]
+        if item["id"] == "key-b"
+    )
+    assert stored_light["request_count"] == 11
 
 
 def test_thread_safety_concurrent_select(tmp_path, monkeypatch):
@@ -2497,7 +2557,7 @@ class TestLeastUsedStrategy:
 
     def test_request_count_increments(self):
         """Each select() call should increment the chosen entry's request_count."""
-        from unittest.mock import patch as _patch
+        from unittest.mock import MagicMock, patch as _patch
         from agent.credential_pool import CredentialPool, PooledCredential, STRATEGY_LEAST_USED
 
         entries = [
@@ -2508,6 +2568,7 @@ class TestLeastUsedStrategy:
         ]
         with _patch("agent.credential_pool.get_pool_strategy", return_value=STRATEGY_LEAST_USED):
             pool = CredentialPool("test", entries)
+        pool._persist = MagicMock()
 
         # First select should pick entry with lowest count (both 0 → first)
         e1 = pool.select()

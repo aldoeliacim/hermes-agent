@@ -210,6 +210,50 @@ def test_resolve_runtime_provider_anthropic_keeps_azure_base_url(monkeypatch):
     assert resolved["base_url"] == "https://myhost.azure.com/anthropic"
 
 
+def test_resolve_runtime_provider_anthropic_pool_unavailable_reports_state(monkeypatch):
+    class _Entry:
+        id = "anthropic-a"
+        label = "aldoeliacim@hotmail.com"
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://api.anthropic.com"
+        last_status = "exhausted"
+        last_error_code = 429
+        last_error_reason = "rate_limit_error"
+        last_error_message = (
+            "This request would exceed your account's rate limit. Please try again later."
+        )
+        last_error_reset_at = 1781513399.0
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return None
+
+        def entries(self):
+            return [_Entry()]
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "anthropic"})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: None,
+    )
+
+    with pytest.raises(rp.AuthError) as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic")
+
+    message = str(exc_info.value)
+    assert "Anthropic credential pool has 1 configured credential" in message
+    assert "aldoeliacim@hotmail.com: exhausted (rate_limit_error)" in message
+    assert "2026-06-15 08:49 UTC" in message
+    assert "No Anthropic credentials found" not in message
+    assert exc_info.value.code == "credential_pool_unavailable"
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")

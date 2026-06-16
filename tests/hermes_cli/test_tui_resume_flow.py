@@ -863,6 +863,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.runtime_provider",
         mod(
             "hermes_cli.runtime_provider",
+            AuthError=type("AuthError", (RuntimeError,), {}),
             resolve_runtime_provider=lambda **_kwargs: {
                 "api_key": "k",
                 "base_url": "u",
@@ -884,6 +885,91 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+
+
+def test_oneshot_uses_configured_fallback_when_primary_auth_unavailable(monkeypatch):
+    """-z must not abort before AIAgent exists when the primary pool is unavailable."""
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+    calls = []
+
+    class FakeAuthError(Exception):
+        pass
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"final_response": "OK", "failed": False, "partial": False}
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    def fake_resolve_runtime_provider(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("requested") in (None, "anthropic"):
+            raise FakeAuthError("primary pool unavailable")
+        assert kwargs["requested"] == "openai-codex"
+        assert kwargs["target_model"] == "gpt-5.5"
+        return {
+            "api_key": "codex-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "credential_pool": None,
+        }
+
+    monkeypatch.setattr(
+        oneshot_mod,
+        "get_fallback_chain",
+        lambda _cfg: [{"provider": "openai-codex", "model": "gpt-5.5"}],
+    )
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {"model": {"default": "primary-model", "provider": "anthropic"}},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        mod("hermes_cli.models", detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            AuthError=FakeAuthError,
+            resolve_runtime_provider=fake_resolve_runtime_provider,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: set()),
+    )
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
+
+    text, result = oneshot_mod._run_agent("smoke")
+    assert text == "OK"
+    assert calls[0]["target_model"] == "primary-model"
+    assert calls[1] == {"requested": "openai-codex", "target_model": "gpt-5.5"}
+    assert captured["provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.5"
+    assert captured["prompt"] == "smoke"
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
