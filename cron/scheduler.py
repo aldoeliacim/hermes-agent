@@ -2813,7 +2813,7 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import set_session_vars, clear_session_vars, reset_cron_delivery_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3455,8 +3455,12 @@ def run_job(
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
-        for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+        # Restore the cron-delivery vars to their *never set* (_UNSET) state, not
+        # "" — an empty string suppresses the os.environ fallback in
+        # get_session_env, so setting "" here would leak an empty cron-delivery
+        # value into every later caller in this thread/task (cross-run / cross-
+        # test pollution). reset_cron_delivery_vars() returns them to _UNSET.
+        reset_cron_delivery_vars()
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected
