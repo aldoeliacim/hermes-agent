@@ -409,6 +409,11 @@ def test_is_broadcast_chat_helper_recognizes_common_jids():
     assert WhatsAppAdapter._is_broadcast_chat("  status@broadcast  ") is True
     assert WhatsAppAdapter._is_broadcast_chat("120363999999999999@newsletter") is True
     assert WhatsAppAdapter._is_broadcast_chat("1234@broadcast") is True  # broadcast list
+    # status@s.whatsapp.net is the @s.whatsapp.net-domain spelling of the
+    # Status pseudo-chat — must drop like status@broadcast, not be treated as
+    # a regular DM (regression: it slipped past the gate on the open-DM path).
+    assert WhatsAppAdapter._is_broadcast_chat("status@s.whatsapp.net") is True
+    assert WhatsAppAdapter._is_broadcast_chat("STATUS@S.WHATSAPP.NET") is True
     # Real chats must not match.
     assert WhatsAppAdapter._is_broadcast_chat("34612345678@s.whatsapp.net") is False
     assert WhatsAppAdapter._is_broadcast_chat("120363001234567890@g.us") is False
