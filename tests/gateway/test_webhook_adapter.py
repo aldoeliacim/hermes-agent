@@ -109,6 +109,11 @@ def _generic_v2_signature(body: bytes, secret: str, timestamp: str) -> str:
     return hmac.new(secret.encode(), signed_content, hashlib.sha256).hexdigest()
 
 
+def _linear_signature(body: bytes, secret: str) -> str:
+    """Compute Linear-Signature (plain HMAC-SHA256 hex) for *body*."""
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def _svix_signature(body: bytes, secret: str, msg_id: str, timestamp: str) -> str:
     """Compute a Svix v1 signature header for *body* using *secret*."""
     key = (
@@ -158,6 +163,25 @@ class TestValidateSignature:
         adapter = _make_adapter()
         req = _mock_request(headers={"X-Gitlab-Token": "wrong"})
         assert adapter._validate_signature(req, b"{}", "correct") is False
+
+    def test_validate_linear_signature_valid(self):
+        """Valid Linear-Signature is accepted."""
+        adapter = _make_adapter()
+        body = b'{"action":"create","type":"Issue"}'
+        secret = "linear-webhook-secret"
+        sig = _linear_signature(body, secret)
+        req = _mock_request(headers={"Linear-Signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_linear_signature_wrong_body_rejects(self):
+        """Linear signatures are bound to the exact raw request body."""
+        adapter = _make_adapter()
+        signed_body = b'{"action":"create","type":"Issue"}'
+        received_body = b'{"type":"Issue","action":"create"}'
+        secret = "linear-webhook-secret"
+        sig = _linear_signature(signed_body, secret)
+        req = _mock_request(headers={"Linear-Signature": sig})
+        assert adapter._validate_signature(req, received_body, secret) is False
 
     def test_validate_no_signature_with_secret_rejects(self):
         """Secret configured but no recognised signature header → reject."""
@@ -541,6 +565,47 @@ class TestEventFilter:
                 headers={"X-GitHub-Event": "pull_request"},
             )
             assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_event_filter_accepts_linear_event_header(self):
+        """Linear-Event header is used for event filtering and delivery IDs."""
+        routes = {
+            "linear": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["Issue"],
+                "prompt": "Linear issue {action}: {data.identifier}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/linear",
+                json={
+                    "action": "create",
+                    "type": "Issue",
+                    "data": {"identifier": "ENG-1"},
+                },
+                headers={
+                    "Linear-Event": "Issue",
+                    "Linear-Delivery": "delivery-1",
+                },
+            )
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["event"] == "Issue"
+            assert data["delivery_id"] == "delivery-1"
+
+        assert len(captured) == 1
+        assert captured[0].message_id == "delivery-1"
+        assert "ENG-1" in captured[0].text
 
     @pytest.mark.asyncio
     async def test_event_filter_rejects_non_matching(self):

@@ -567,6 +567,7 @@ class WebhookAdapter(BasePlatformAdapter):
         event_type = (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
+            or request.headers.get("Linear-Event", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
             or "unknown"
@@ -661,8 +662,11 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
             request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                "Linear-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                ),
             ),
         )
 
@@ -895,7 +899,7 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, GitLab, Linear, Svix, generic HMAC-SHA256)."""
         def _header(name: str) -> str:
             return (
                 request.headers.get(name, "")
@@ -933,6 +937,15 @@ class WebhookAdapter(BasePlatformAdapter):
         gl_token = request.headers.get("X-Gitlab-Token", "")
         if gl_token:
             return hmac.compare_digest(gl_token, secret)
+
+        # Linear: Linear-Signature = <hex HMAC-SHA256(raw_body)>
+        # Docs: https://linear.app/developers/webhooks#validating-webhooks
+        linear_sig = request.headers.get("Linear-Signature", "")
+        if linear_sig:
+            expected = hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            return hmac.compare_digest(linear_sig, expected)
 
         # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
         #             X-Webhook-Timestamp = <unix seconds> (required for V2)
