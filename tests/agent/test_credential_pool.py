@@ -331,6 +331,112 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
 
     pool = load_pool("openai-codex")
     assert pool.has_available() is False
+    # The cooldown is correctly honored for AVAILABILITY (has_available=False),
+    # but select() no longer returns None when an exhausted entry still carries
+    # a real token: it falls back to that token rather than emitting a keyless
+    # "Bearer None" request that would loop on a misleading provider error.
+    # See test_select_last_resort_* below for the dedicated coverage.
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+    assert selected.runtime_api_key == "tok-1"
+
+
+def test_select_last_resort_returns_real_token_when_all_exhausted(tmp_path, monkeypatch):
+    """All entries exhausted but carrying tokens -> select() returns the real
+    credential, never None.  Returning None makes the caller send a keyless
+    'Bearer None' request that providers answer with a misleading error,
+    re-exhausting the pool in a death-loop (the 2026-06-16 desktop outage)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-late",
+                        "label": "resets-later",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-oat-late",
+                        "last_status": "exhausted",
+                        "last_status_at": now,
+                        "last_error_code": 429,
+                        "last_error_reset_at": now + 3600,
+                    },
+                    {
+                        "id": "cred-soon",
+                        "label": "resets-soonest",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-ant-oat-soon",
+                        "last_status": "exhausted",
+                        "last_status_at": now,
+                        "last_error_code": 429,
+                        "last_error_reset_at": now + 60,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.has_available() is False
+    selected = pool.select()
+    assert selected is not None, "must not return None -> avoids keyless Bearer None"
+    # Prefers the entry whose cooldown elapses soonest (most likely live).
+    assert selected.id == "cred-soon"
+    assert selected.runtime_api_key == "sk-ant-oat-soon"
+
+
+def test_select_last_resort_skips_dead_and_tokenless_entries(tmp_path, monkeypatch):
+    """A DEAD (revoked) entry or one with no token is never a last resort."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-dead",
+                        "label": "revoked",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-oat-dead",
+                        "last_status": "dead",
+                        "last_status_at": now,
+                    },
+                    {
+                        "id": "cred-empty",
+                        "label": "no-token",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "",
+                        "last_status": "exhausted",
+                        "last_status_at": now,
+                        "last_error_reset_at": now + 60,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    # No usable last resort: DEAD is excluded, tokenless exhausted is excluded.
     assert pool.select() is None
 
 

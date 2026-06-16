@@ -1549,9 +1549,51 @@ class CredentialPool:
             self._persist(removed_ids=entries_to_prune)
         return available
 
+    def _last_resort_entry(self) -> Optional[PooledCredential]:
+        """Pick the least-bad EXHAUSTED entry that still carries a real token.
+
+        When every entry is in exhaustion cooldown, returning ``None`` makes the
+        caller build a **keyless** client (``Authorization: Bearer None``).  A
+        keyless request doesn't fail cleanly — providers answer with a generic,
+        often *misleading* error (e.g. Anthropic's "third-party apps now draw
+        from your extra usage" 400), which the failover classifier then re-marks
+        as exhausted on a bogus signal.  That is a self-perpetuating death-loop:
+        keyless request -> fake error -> re-exhaust -> keyless request, and the
+        surface (gateway/desktop) goes fully dead with no reply.
+
+        Sending the REAL token one more time is strictly better: either it now
+        succeeds (the cooldown was conservative / the upstream recovered), or it
+        returns an ACCURATE 429/400 carrying a real ``reset_at`` so backoff is
+        truthful.  We never invent capacity — we just refuse to send ``None``.
+
+        Only entries with a non-empty ``runtime_api_key`` qualify (a DEAD entry
+        with no token is useless as a last resort).  Prefer the entry whose
+        cooldown elapses soonest, so we retry the one most likely to be live.
+        """
+        candidates = [
+            e for e in self._entries
+            if e.last_status == STATUS_EXHAUSTED and e.runtime_api_key
+        ]
+        if not candidates:
+            return None
+        # Soonest reset first; entries with no known reset_at sort last.
+        candidates.sort(key=lambda e: _exhausted_until(e) or float("inf"))
+        return candidates[0]
+
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
+            last_resort = self._last_resort_entry()
+            if last_resort is not None:
+                self._current_id = last_resort.id
+                logger.warning(
+                    "credential pool: all entries exhausted — using last-resort "
+                    "entry %s with its real token rather than returning no "
+                    "credential (avoids a keyless 'Bearer None' request that "
+                    "would loop on a misleading provider error)",
+                    last_resort.label or last_resort.id[:8],
+                )
+                return last_resort
             self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
