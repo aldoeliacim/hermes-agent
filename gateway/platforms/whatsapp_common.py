@@ -158,6 +158,12 @@ class WhatsAppBehaviorMixin:
         cid = chat_id.strip().lower()
         if cid == "status@broadcast":
             return True
+        # status@s.whatsapp.net is the @s.whatsapp.net-domain spelling of the
+        # Status pseudo-chat (Baileys surfaces both). Without this, a Status
+        # update arriving under that JID slips past the broadcast gate and is
+        # treated as a regular DM on the open-DM path.
+        if cid == "status@s.whatsapp.net":
+            return True
         # @broadcast suffix covers status@broadcast plus any future
         # broadcast-list variants. @newsletter is the Channel JID suffix.
         if cid.endswith("@broadcast") or cid.endswith("@newsletter"):
