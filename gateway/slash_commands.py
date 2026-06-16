@@ -4394,6 +4394,23 @@ class GatewaySlashCommandsMixin:
             resolve_gateway_approval, has_blocking_approval,
         )
 
+        # OWNER GATE: a non-owner contact must not be able to authorize a
+        # dangerous command, even if an approval prompt somehow reached them.
+        # The notify path already auto-denies + hides the gate for non-owner
+        # silos (see _approval_notify_sync), but guard the resolve path too so
+        # a stray "/approve" typed by a contact can never execute anything.
+        try:
+            if self._should_skip_user_profile_for_source(source=source, session_key=session_key):
+                logger.warning(
+                    "Ignoring /approve from non-owner silo (session_key=%s)", session_key,
+                )
+                # Fail closed: deny anything pending, then report nothing to approve.
+                if has_blocking_approval(session_key):
+                    resolve_gateway_approval(session_key, "deny", resolve_all=True)
+                return t("gateway.approve.no_pending")
+        except Exception:
+            pass
+
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)

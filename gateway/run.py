@@ -465,6 +465,33 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+# --- Outbound secret backstop for non-owner silos -------------------------
+# The PRIMARY owner-identity defense is prompt-side: skip_user_profile gates
+# USER.md (the owner's name/phones/inner-circle glossary) entirely out of a
+# non-owner contact's prompt, so the model has no owner identity to leak.  We
+# deliberately do NOT cosmetically rewrite the owner's *name* out of outbound
+# prose on non-owner silos: a blanket "Aldo" -> "the owner" substitution
+# produces stilted, robotic text that is arguably MORE conspicuous to a
+# contact than a name slipping through once, and a whole-message regex over the
+# reply also mangles FILE:/MEDIA: delivery paths (silently dropping
+# attachments).  What we DO keep as a send-path backstop on proven non-owner
+# silos is genuine sensitive-info redaction (credentials/tokens/keys via
+# _redact_gateway_user_facing_secrets) — the same secret scrub that
+# _sanitize_gateway_final_response already applies to Telegram, extended to all
+# platforms for non-owner destinations.  This never touches names, tone, or
+# delivery paths.
+
+
+def _redact_secrets_for_non_owner(text: str) -> str:
+    """Scrub credentials/tokens/keys from an outbound message bound for a
+    proven NON-OWNER silo.  Caller must have already confirmed the destination
+    is a proven non-owner silo (skip_user_profile=True).  Names, tone, and
+    FILE:/MEDIA: delivery paths are intentionally left untouched."""
+    if not text:
+        return text
+    return _redact_gateway_user_facing_secrets(str(text))
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -11843,6 +11870,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
 
+            # Outbound secret backstop: on a proven NON-OWNER silo, scrub any
+            # credentials/tokens/keys before the reply leaves the gateway. This
+            # is the same secret scrub _sanitize_gateway_final_response applies
+            # to Telegram, extended to all platforms for non-owner destinations.
+            # The owner's NAME is intentionally NOT rewritten (skip_user_profile
+            # already gates USER.md out of the prompt, and a blanket name->the
+            # owner substitution reads as robotic and mangles FILE:/MEDIA: paths).
+            # Fail-open on any error.
+            try:
+                if response and self._should_skip_user_profile_for_source(
+                    source=source, session_key=session_key,
+                ):
+                    response = _redact_secrets_for_non_owner(response)
+            except Exception as _e:
+                logger.debug("Non-owner secret backstop skipped: %s", _e)
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
             # If the agent's session_id changed during compression, update
@@ -18886,14 +18928,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 unregister_gateway_notify,
             )
 
+            # Owner gate for the dangerous-command approval UX.  The approval
+            # prompt ("/approve to execute …") authorizes the agent to run a
+            # command flagged dangerous.  That decision belongs to the agent
+            # OWNER only — never to an arbitrary contact whose DM the agent
+            # happens to be working in.  Reuse the already-computed non-owner
+            # signal (the same one that hides USER.md): when this is a proven
+            # non-owner silo, we must NOT surface the gate to the contact and
+            # must NOT accept their reply as authorization.  Observed 2026-06-11:
+            # a content user (Victor) was shown the gate and typed "Approve",
+            # exposing internal machinery he can neither understand nor own.
+            _approval_is_non_owner = False
+            try:
+                _approval_is_non_owner = self._should_skip_user_profile_for_source(
+                    source=source,
+                    session_key=session_key,
+                    user_config=user_config,
+                )
+            except Exception:
+                # Fail closed: if we cannot prove ownership, treat as non-owner.
+                _approval_is_non_owner = (
+                    source is not None and source.platform != Platform.LOCAL
+                )
+
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
 
-                If the adapter supports interactive button-based approvals
-                (e.g. Discord's ``send_exec_approval``), use that for a richer
+                Non-owner silos NEVER see this gate: the command is auto-denied
+                and the owner is alerted on Telegram instead (see owner gate
+                above).  Otherwise, if the adapter supports interactive
+                button-based approvals (e.g. Discord's ``send_exec_approval``),
+                use that for a richer
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+                cmd = approval_data.get("command", "")
+                desc = approval_data.get("description", "dangerous command")
+
+                # OWNER GATE: never surface the dangerous-command approval to a
+                # non-owner contact.  Auto-deny so the blocked agent thread
+                # resumes and the tool refuses the command, then alert the owner
+                # on Telegram.  This keeps internal machinery (and the very
+                # notion of "approving" agent actions) out of contacts' chats.
+                if _approval_is_non_owner:
+                    try:
+                        from tools.approval import resolve_gateway_approval
+                        resolve_gateway_approval(
+                            _approval_session_key, "deny", resolve_all=True,
+                        )
+                    except Exception as _e:
+                        logger.error("Non-owner approval auto-deny failed: %s", _e)
+                    # Best-effort owner escalation on Telegram (home channel).
+                    try:
+                        _tg_adapter = self.adapters.get(Platform.TELEGRAM)
+                        _tg_home = self.config.get_home_channel(Platform.TELEGRAM)
+                        if _tg_adapter and _tg_home and _tg_home.chat_id:
+                            _who = (
+                                getattr(source, "user_name", None)
+                                or getattr(source, "chat_name", None)
+                                or "a non-owner contact"
+                            )
+                            _cmd_preview = cmd[:200] + "…" if len(cmd) > 200 else cmd
+                            _alert = (
+                                "⛔ Blocked a dangerous command that a non-owner "
+                                f"chat triggered (auto-denied).\n\nContact: {_who}\n"
+                                f"Command:\n```\n{_cmd_preview}\n```\nReason: {desc}\n\n"
+                                "The approval gate was NOT shown to them. Run it "
+                                "yourself from your own session if you want it executed."
+                            )
+                            safe_schedule_threadsafe(
+                                _tg_adapter.send(str(_tg_home.chat_id), _alert),
+                                _loop_for_step,
+                                logger=logger,
+                                log_message="Non-owner approval owner-alert error",
+                            )
+                    except Exception as _e:
+                        logger.error("Non-owner approval owner-alert failed: %s", _e)
+                    return
+
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
                 # assistant_threads_setStatus disables the compose box — the
