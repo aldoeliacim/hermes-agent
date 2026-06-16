@@ -5923,7 +5923,12 @@ def get_codex_auth_status() -> Dict[str, Any]:
         from agent.credential_pool import load_pool
         pool = load_pool("openai-codex")
         if pool and pool.has_credentials():
-            entry = pool.select()
+            # Gate the healthy-login return on has_available(): select() now
+            # returns a last-resort exhausted entry rather than None when every
+            # entry is in cooldown, so without this an exhausted (rate-limited)
+            # pool would be mis-reported as a healthy login. When nothing is
+            # available we fall through to the rate-limit status branch below.
+            entry = pool.select() if pool.has_available() else None
             if entry is not None:
                 api_key = (
                     getattr(entry, "runtime_api_key", None)
@@ -5982,7 +5987,9 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
 
         pool = load_pool("xai-oauth")
         if pool and pool.has_credentials():
-            entry = pool.select()
+            # See get_codex_auth_status: gate select() on has_available() so a
+            # last-resort exhausted entry isn't mis-reported as a healthy login.
+            entry = pool.select() if pool.has_available() else None
             if entry is not None:
                 api_key = (
                     getattr(entry, "runtime_api_key", None)
