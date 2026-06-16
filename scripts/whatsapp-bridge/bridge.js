@@ -931,6 +931,11 @@ app.post('/send-media', async (req, res) => {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
 
+  // Tracks a temp file created by ffmpeg audio conversion so it can be
+  // cleaned up after the send completes (success or failure). Declared
+  // outside the try so the finally block can always see it.
+  let tempAudioPath = null;
+
   try {
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: `File not found: ${filePath}` });
@@ -986,6 +991,9 @@ app.post('/send-media', async (req, res) => {
         if (needsConversion) {
           tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
           try {
+            // execFileSync with an argument array — never goes through a shell,
+            // so a malicious filePath (e.g. containing $(...) or backticks)
+            // cannot inject commands. Replaces the prior execSync shell string.
             execFileSync(
               'ffmpeg',
               ['-y', '-i', filePath, '-ar', '48000', '-ac', '1', '-c:a', 'libopus', tmpPath],
@@ -993,8 +1001,11 @@ app.post('/send-media', async (req, res) => {
             );
             audioBuffer = readFileSync(tmpPath);
             audioExt = 'ogg';
+            tempAudioPath = tmpPath;
           } catch (convErr) {
-            // ffmpeg not available or conversion failed — fall back to original format
+            // ffmpeg not available or conversion failed — fall back to original format.
+            // Clean up a partial temp file if ffmpeg created one before failing.
+            try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best-effort */ }
             console.warn('[bridge] ffmpeg conversion failed, sending as file attachment:', convErr.message);
           } finally {
             try { if (tmpPath && existsSync(tmpPath)) unlinkSync(tmpPath); } catch (_) {}
@@ -1013,6 +1024,32 @@ app.post('/send-media', async (req, res) => {
     const sent = await sendWithTimeout(chatId, msgPayload);
     trackSentMessageId(sent);
     messageStore.remember(sent);
+
+    res.json({ success: true, messageId: sent?.key?.id, quoted: Boolean(options.quoted) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    // Clean up the ffmpeg-converted temp file regardless of send outcome.
+    if (tempAudioPath) {
+      try { if (existsSync(tempAudioPath)) unlinkSync(tempAudioPath); } catch { /* best-effort */ }
+    }
+  }
+});
+
+// React to a normal WhatsApp message cached by the bridge
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, messageId, emoji } = req.body;
+  if (!chatId || !messageId || emoji === undefined) {
+    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
+  }
+  const target = resolveStoredMessage(chatId, messageId);
+  if (!target) return res.status(404).json({ error: 'Referenced message not found in bridge cache' });
+  try {
+    const sent = await sock.sendMessage(chatId, { react: { text: emoji, key: target.key } });
+    trackSentMessageId(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
