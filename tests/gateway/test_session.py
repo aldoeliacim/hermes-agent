@@ -430,6 +430,104 @@ class TestBuildSessionContextPrompt:
         assert "Multi-user thread" not in prompt
 
 
+class TestSharedAudienceConfidentialityGuard:
+    """The session-context prompt must warn against leaking owner-private /
+    backend-internal detail into any multi-person (non-DM) audience.
+
+    Regression for the ProgramaLoL incident: an owner-authorized onboarding
+    command issued from inside a WhatsApp group caused the agent to post
+    backend internals (allowlists, bridges, silos, LIDs) and other members'
+    phone fragments + names into the shared group. The guard is a behavior
+    contract — assert the invariant ("present iff multi-person audience"),
+    not the exact wording.
+    """
+
+    _MARKER = "Shared audience — confidentiality"
+
+    def _prompt(self, source, **config_kwargs):
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")},
+            **config_kwargs,
+        )
+        return build_session_context_prompt(build_session_context(source, config))
+
+    def test_group_audience_gets_confidentiality_guard(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_name="ProgramaLoL",
+            chat_type="group",
+            user_name="Alice",
+        )
+        prompt = self._prompt(source)
+        assert self._MARKER in prompt
+        # The actionable instruction: route owner/backend detail privately.
+        assert "private channel" in prompt
+        assert "owner-private" in prompt or "backend-internal" in prompt
+
+    def test_per_user_isolated_group_still_gets_guard(self):
+        """Incident config: group_sessions_per_user=True isolates per user but
+        every reply still lands in the shared channel, so the guard MUST fire."""
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_name="ProgramaLoL",
+            chat_type="group",
+            user_name="Alice",
+        )
+        prompt = self._prompt(source, group_sessions_per_user=True)
+        assert self._MARKER in prompt
+
+    def test_shared_group_gets_guard(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_name="ProgramaLoL",
+            chat_type="group",
+            user_name="Alice",
+        )
+        prompt = self._prompt(source, group_sessions_per_user=False)
+        assert self._MARKER in prompt
+
+    def test_thread_audience_gets_guard(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_name="Test Group",
+            chat_type="group",
+            thread_id="17585",
+            user_name="Alice",
+        )
+        prompt = self._prompt(source)
+        assert self._MARKER in prompt
+
+    def test_channel_audience_gets_guard(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100333",
+            chat_name="Announcements",
+            chat_type="channel",
+        )
+        prompt = self._prompt(source)
+        assert self._MARKER in prompt
+
+    def test_dm_is_exempt(self):
+        """A 1:1 DM is owner-private by nature; no shared-audience warning."""
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_type="dm",
+            user_name="Owner",
+        )
+        prompt = self._prompt(source)
+        assert self._MARKER not in prompt
+
+    def test_local_cli_is_exempt(self):
+        source = SessionSource(platform=Platform.LOCAL, chat_id="cli", chat_type="dm")
+        prompt = self._prompt(source)
+        assert self._MARKER not in prompt
+
+
 class TestSenderPrefixWithBackfill:
     """Regression: sender prefix must not wrap the backfill context block.
 
@@ -788,6 +886,39 @@ class TestWhatsAppSessionKeyConsistency:
         assert first_entry.session_key == "agent:main:discord:group:guild-123"
         assert second_entry.session_key == "agent:main:discord:group:guild-123"
         assert first_entry.session_id == second_entry.session_id
+
+    def test_shared_group_two_users_share_one_coherent_session(self, store):
+        """ProgramaLoL incident — coherence half.
+
+        With group_sessions_per_user=False, two DIFFERENT humans posting to the
+        same group must resolve to ONE session_id so the agent keeps a single
+        coherent context. The incident showed the failure mode: one user's run
+        held the onboarding context while a second user's separate shard had
+        none and contradicted it ("no traigo contexto de qué son esos IDs").
+        Locking this invariant prevents that split-brain from returning via a
+        default flip.
+        """
+        store.config.group_sessions_per_user = False
+        aldo = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="120363@g.us",
+            chat_type="group",
+            user_id="96370627199010@lid",
+            user_name="Aldo",
+        )
+        necro = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="120363@g.us",
+            chat_type="group",
+            user_id="74831349469423@lid",
+            user_name="Necro",
+        )
+        aldo_entry = store.get_or_create_session(aldo)
+        necro_entry = store.get_or_create_session(necro)
+
+        # Same group → same key → same single coherent session.
+        assert aldo_entry.session_key == necro_entry.session_key
+        assert aldo_entry.session_id == necro_entry.session_id
 
     def test_telegram_dm_includes_chat_id(self):
         """Non-WhatsApp DMs should also include chat_id to separate users."""
