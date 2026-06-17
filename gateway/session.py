@@ -503,6 +503,46 @@ def build_session_context_prompt(
             "unless the Current Session Context says the current User is the owner."
         )
 
+    # Shared-audience confidentiality guard.
+    #
+    # A non-DM chat (group/channel/thread, or any session flagged as shared
+    # multi-user) is read by EVERY participant, not just the owner. Owner-only
+    # operational detail must never default to such a chat just because the
+    # triggering command happened to arrive there. This block is cache-stable
+    # (no per-turn data) so it does not bust the prompt cache.
+    #
+    # Gated on the audience being multi-person rather than on the per-user
+    # isolation knob: a group with group_sessions_per_user=True still posts
+    # every reply to the shared channel, so the audience is shared regardless.
+    _is_dm = context.source.chat_type == "dm"
+    _multi_person_audience = (
+        context.source.platform != Platform.LOCAL
+        and not _is_dm
+        and (
+            context.shared_multi_user_session
+            or context.source.chat_type in ("group", "channel", "thread")
+            or bool(context.source.thread_id)
+        )
+    )
+    if _multi_person_audience:
+        lines.append("")
+        lines.append(
+            "**Shared audience — confidentiality:** This chat is read by every "
+            "participant, NOT just the owner. Treat it as a public, non-owner "
+            "audience. Do NOT post owner-private or backend-internal detail here, "
+            "even when an authorized owner command triggered the work. Never "
+            "reveal in this chat: agent/infrastructure internals (config files, "
+            ".env, allowlists, bridges, session/silo/memory mechanics, gateway "
+            "restart/drain behavior, IDs/LIDs, internal tooling), or other "
+            "people's personal data (phone numbers or fragments, the names "
+            "behind those numbers, contact mappings). When an owner asks for an "
+            "administrative/backend action from inside a shared chat, perform it "
+            "and send the detailed operational report to the OWNER's private "
+            "channel (DM / the owner's home channel) — post at most a brief, "
+            "neutral acknowledgement to the shared chat, or nothing. When in "
+            "doubt about whether a detail is owner-private, route it privately."
+        )
+
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
         lines.append("")
