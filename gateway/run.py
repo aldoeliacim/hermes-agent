@@ -19275,10 +19275,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Native image attachment: skipped %d unreadable path(s): %s",
                                 len(_skipped), _skipped,
                             )
-                        if any(p.get("type") == "image_url" for p in _parts):
+                        _img_parts = sum(
+                            1 for p in _parts if p.get("type") == "image_url"
+                        )
+                        if _img_parts:
                             _run_message: Any = _parts
+                            # Confirm at the ATTACH site how many image parts
+                            # actually made it onto the turn. The prepare-time
+                            # log ("N image(s) will be attached") fires before
+                            # the bytes are read, so a silent drop between the
+                            # two sites was previously invisible. This closes
+                            # that observability gap.
+                            logger.info(
+                                "Native image attachment: attached %d image part(s) "
+                                "to the user turn (buffered=%d, skipped=%d).",
+                                _img_parts, len(_native_imgs), len(_skipped),
+                            )
                         else:
                             # All images failed to read — fall back to plain text.
+                            logger.warning(
+                                "Native image attachment: 0 image parts attached "
+                                "despite %d buffered path(s) — falling back to "
+                                "text-only turn (the model will NOT see the image).",
+                                len(_native_imgs),
+                            )
                             _run_message = message
                     except Exception as _img_exc:
                         logger.warning(
