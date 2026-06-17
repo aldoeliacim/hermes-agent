@@ -281,6 +281,42 @@ def test_broadcast_dm_routes_replies_to_sender_not_broadcast_jid():
     assert event.source.user_id == "230893885100129@lid"
 
 
+def test_broadcast_dm_sender_fallback_to_from_when_senderid_absent():
+    """Regression: the gate (_should_process_message) admits a broadcast-list
+    DM when EITHER ``senderId`` or ``from`` supplies a non-broadcast sender,
+    but ``_build_message_event`` previously read only ``senderId`` for route
+    and user_id construction. That left an input the gate explicitly accepted
+    (``from`` present, ``senderId`` absent) routed to the undeliverable
+    ``@broadcast`` JID with a null user_id. Routing must use the same
+    ``senderId`` -> ``from`` fallback as the gate.
+    """
+    adapter = _make_adapter(dm_policy="allowlist", allow_from=["230893885100129@lid"])
+
+    data = _dm_message(
+        "hola hal",
+        chatId="1778109128@broadcast",
+        **{
+            "from": "230893885100129@lid",
+            "senderName": "Jorge Alberto Pasillas",
+            "chatName": "Jorge Alberto Pasillas",
+        },
+    )
+    # The fallback shape: senderId absent, only `from` carries the sender.
+    data.pop("senderId", None)
+
+    # Gate admits it (parity precondition for the bug).
+    assert adapter._should_process_message(data) is True
+
+    event = asyncio.run(adapter._build_message_event(data))
+
+    assert event is not None
+    # Routed to the deliverable sender JID, not the broadcast JID.
+    assert event.source.chat_id == "230893885100129@lid"
+    assert event.source.chat_id_alt == "1778109128@broadcast"
+    # user_id falls back to `from` instead of being None.
+    assert event.source.user_id == "230893885100129@lid"
+
+
 # --- New group_policy tests ---
 
 def test_group_policy_disabled_blocks_all_groups():

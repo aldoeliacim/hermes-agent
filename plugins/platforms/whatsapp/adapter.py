@@ -1356,12 +1356,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             chat_type = "group" if is_group else "dm"
 
             # Broadcast-list DMs arrive with chatId like
-            # ``1778109128@broadcast`` and senderId set to the human's JID/LID.
-            # Replies to the broadcast JID are not deliverable, so route the
-            # session through the sender while retaining the broadcast JID as an
-            # alias for channel-directory/session lookup.
+            # ``1778109128@broadcast`` and the human sender in ``senderId``
+            # (or, on some bridge payloads, only in ``from``). Replies to the
+            # broadcast JID are not deliverable, so route the session through
+            # the sender while retaining the broadcast JID as an alias for
+            # channel-directory/session lookup.
+            #
+            # The sender fallback (``senderId`` then ``from``) MUST match the
+            # gate in ``_should_process_message`` (whatsapp_common.py), which
+            # admits a broadcast-list DM when EITHER field supplies a
+            # non-broadcast sender. If routing read only ``senderId`` it would
+            # keep the undeliverable ``@broadcast`` JID (and a null user_id)
+            # for an input the gate explicitly accepted.
             raw_chat_id = str(data.get("chatId") or "")
-            sender_id = str(data.get("senderId") or "")
+            sender_id = str(data.get("senderId") or data.get("from") or "")
             source_chat_id = raw_chat_id
             source_chat_id_alt = None
             if (
@@ -1379,7 +1387,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 chat_id_alt=source_chat_id_alt,
                 chat_name=data.get("chatName"),
                 chat_type=chat_type,
-                user_id=data.get("senderId"),
+                user_id=data.get("senderId") or data.get("from"),
                 user_name=data.get("senderName"),
             )
             
