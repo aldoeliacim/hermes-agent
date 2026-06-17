@@ -19289,6 +19289,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _run_message = message
 
+                # Record the inbound images attached THIS turn so the native
+                # vision fast path can refuse a stale cache path that reached
+                # the model via transcript replay or memory recall (it would
+                # otherwise silently describe an older, unrelated image).
+                # Set unconditionally — an empty list means "no inbound image
+                # this turn", which correctly makes any image_cache path stale.
+                _vision_turn_token = None
+                try:
+                    from tools.vision_tools import set_current_turn_image_paths
+                    _vision_turn_token = set_current_turn_image_paths(_native_imgs or [])
+                except Exception:
+                    _vision_turn_token = None
+
                 _api_run_message = _wrap_current_message_with_observed_context(
                     _run_message,
                     observed_group_context,
@@ -19307,6 +19320,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
+                try:
+                    if _vision_turn_token is not None:
+                        from tools.vision_tools import reset_current_turn_image_paths
+                        reset_current_turn_image_paths(_vision_turn_token)
+                except Exception:
+                    pass
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,

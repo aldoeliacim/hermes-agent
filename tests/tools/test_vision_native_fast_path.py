@@ -303,3 +303,118 @@ class TestHandleVisionAnalyzeFastPath:
         assert isinstance(result, str)
         assert json.loads(result) == {"sentinel": "aux-path"}
         mock_aux.assert_called_once()
+
+
+# ─── stale inbound-cache image guard ─────────────────────────────────────────
+
+
+class TestStaleInboundCacheGuard:
+    """Native fast path must refuse an inbound-cache image that wasn't attached
+    on the current turn.
+
+    Regression for 2026-06-17: a stale ``image_cache/img_*.jpg`` path recalled
+    from memory was loaded and described as the wrong image. The guard only
+    polices files inside the inbound image-cache dir; everything else (browser
+    screenshots, generated images, arbitrary local files) and CLI/test contexts
+    with no turn set are unaffected.
+    """
+
+    def _run(self, coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def test_no_turn_context_allows_any_cache_path(self, tmp_path, monkeypatch):
+        """Default (contextvar None) — CLI/tests — never restricts."""
+        from tools import vision_tools
+
+        cache_dir = tmp_path / "image_cache"
+        cache_dir.mkdir()
+        img = cache_dir / "img_deadbeef0001.png"
+        img.write_bytes(_TINY_PNG)
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_image_cache_dir", lambda: cache_dir
+        )
+
+        # No set_current_turn_image_paths call -> contextvar is None -> inert.
+        result = self._run(vision_tools._vision_analyze_native(str(img), "?"))
+        assert isinstance(result, dict) and result.get("_multimodal") is True
+
+    def test_stale_cache_path_rejected_when_not_in_turn(self, tmp_path, monkeypatch):
+        """A cache image absent from the current turn's set is refused."""
+        from tools import vision_tools
+
+        cache_dir = tmp_path / "image_cache"
+        cache_dir.mkdir()
+        fresh = cache_dir / "img_fresh00000001.png"
+        fresh.write_bytes(_TINY_PNG)
+        stale = cache_dir / "img_stale00000002.png"
+        stale.write_bytes(_TINY_PNG)
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_image_cache_dir", lambda: cache_dir
+        )
+
+        # This turn attached only the fresh image.
+        token = vision_tools.set_current_turn_image_paths([str(fresh)])
+        try:
+            stale_res = self._run(vision_tools._vision_analyze_native(str(stale), "?"))
+            fresh_res = self._run(vision_tools._vision_analyze_native(str(fresh), "?"))
+        finally:
+            vision_tools.reset_current_turn_image_paths(token)
+
+        # Stale path fails closed with a clear, actionable error.
+        assert isinstance(stale_res, str)
+        parsed = json.loads(stale_res)
+        assert parsed.get("success") is False
+        assert "earlier message" in parsed.get("error", "")
+        # Fresh path (in the turn set) still works.
+        assert isinstance(fresh_res, dict) and fresh_res.get("_multimodal") is True
+
+    def test_empty_turn_set_makes_all_cache_paths_stale(self, tmp_path, monkeypatch):
+        """A turn that attached no inbound images rejects any cache path.
+
+        This is the text-routing / recall case: the user's current message had
+        no image, but a stale cache path was recalled into context.
+        """
+        from tools import vision_tools
+
+        cache_dir = tmp_path / "image_cache"
+        cache_dir.mkdir()
+        stale = cache_dir / "img_stale00000003.png"
+        stale.write_bytes(_TINY_PNG)
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_image_cache_dir", lambda: cache_dir
+        )
+
+        token = vision_tools.set_current_turn_image_paths([])  # no images this turn
+        try:
+            result = self._run(vision_tools._vision_analyze_native(str(stale), "?"))
+        finally:
+            vision_tools.reset_current_turn_image_paths(token)
+
+        assert isinstance(result, str)
+        assert json.loads(result).get("success") is False
+
+    def test_non_cache_path_never_restricted(self, tmp_path, monkeypatch):
+        """Files outside the inbound cache dir are out of scope for the guard.
+
+        Browser screenshots, generated images, and arbitrary local paths must
+        keep working even when the turn set is empty.
+        """
+        from tools import vision_tools
+
+        cache_dir = tmp_path / "image_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_image_cache_dir", lambda: cache_dir
+        )
+
+        # Image lives OUTSIDE the inbound cache dir (e.g. a generated image).
+        other = tmp_path / "generated_image.png"
+        other.write_bytes(_TINY_PNG)
+
+        token = vision_tools.set_current_turn_image_paths([])  # empty turn set
+        try:
+            result = self._run(vision_tools._vision_analyze_native(str(other), "?"))
+        finally:
+            vision_tools.reset_current_turn_image_paths(token)
+
+        assert isinstance(result, dict) and result.get("_multimodal") is True
