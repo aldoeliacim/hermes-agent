@@ -1025,7 +1025,7 @@ app.post('/send-media', async (req, res) => {
     trackSentMessageId(sent);
     messageStore.remember(sent);
 
-    res.json({ success: true, messageId: sent?.key?.id, quoted: Boolean(options.quoted) });
+    res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
