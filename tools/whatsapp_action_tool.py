@@ -100,6 +100,27 @@ def _whatsapp_extra() -> Dict[str, Any] | None:
     return dict(platform_cfg.extra or {})
 
 
+def _bridge_token(extra: Dict[str, Any]) -> str | None:
+    """Read the bridge's loopback capability token from its 0600 session-dir
+    file, so this tool's direct bridge calls are authenticated the same way
+    the adapter's sends are. Returns None if no token file exists (bridge
+    launched without auth — manual/dev), in which case the bridge accepts
+    unauthenticated calls anyway."""
+    from pathlib import Path
+    from hermes_constants import get_hermes_dir
+
+    session_path = extra.get("session_path")
+    if session_path:
+        candidate = Path(session_path) / "bridge-token"
+    else:
+        candidate = Path(get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")) / "bridge-token"
+    try:
+        token = candidate.read_text(encoding="utf-8").strip()
+        return token or None
+    except (OSError, ValueError):
+        return None
+
+
 def _require_string(args: Dict[str, Any], key: str) -> str | None:
     value = args.get(key)
     if value is None:
@@ -165,9 +186,11 @@ async def _post_bridge(extra: Dict[str, Any], endpoint: str, payload: Dict[str, 
 
     bridge_port = extra.get("bridge_port", 3000)
     url = f"http://127.0.0.1:{bridge_port}/{endpoint.lstrip('/')}"
+    token = _bridge_token(extra)
+    headers = {"X-Hermes-Bridge-Token": token} if token else None
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 try:
                     data = await resp.json()
                 except Exception:
