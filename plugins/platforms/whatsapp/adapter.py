@@ -932,6 +932,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         media_type: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
         if not self._running or not self._http_session:
@@ -954,6 +955,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 payload["caption"] = caption
             if file_name:
                 payload["fileName"] = file_name
+            if reply_to:
+                payload["replyTo"] = reply_to
 
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-media",
@@ -974,6 +977,93 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    # ---------------------------------------------------------------- actions
+    # Outbound WhatsApp primitives the generic send path doesn't cover:
+    # emoji reactions to cached messages, private replies to status updates,
+    # reactions to statuses, and posting a text status to an explicit
+    # recipient list.  All route through the bridge's structured action
+    # endpoints (/react, /status-reply, /status-react, /post-status) and are
+    # surfaced to the agent via the service-gated ``whatsapp_action`` tool.
+    async def _post_bridge_action(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        timeout_seconds: int = 30,
+    ) -> SendResult:
+        """Post a structured action to the WhatsApp bridge."""
+        if not self._running or not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        bridge_exit = await self._check_managed_bridge_exit()
+        if bridge_exit:
+            return SendResult(success=False, error=bridge_exit)
+        try:
+            import aiohttp
+            async with self._http_session.post(
+                f"http://127.0.0.1:{self._bridge_port}/{endpoint.lstrip('/')}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"error": await resp.text()}
+                if resp.status == 200:
+                    return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
+                return SendResult(success=False, error=data.get("error") or str(data), raw_response=data)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def react_to_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+    ) -> SendResult:
+        """React to a cached WhatsApp message via the bridge."""
+        return await self._post_bridge_action(
+            "react",
+            {"chatId": chat_id, "messageId": message_id, "emoji": emoji},
+        )
+
+    async def reply_to_status(
+        self,
+        status_message_id: str,
+        message: str,
+        status_author_jid: Optional[str] = None,
+    ) -> SendResult:
+        """Privately reply to a cached WhatsApp status/story."""
+        payload: Dict[str, Any] = {"statusMessageId": status_message_id, "message": message}
+        if status_author_jid:
+            payload["statusAuthorJid"] = status_author_jid
+        return await self._post_bridge_action("status-reply", payload)
+
+    async def react_to_status(
+        self,
+        status_message_id: str,
+        emoji: str,
+        status_author_jid: Optional[str] = None,
+    ) -> SendResult:
+        """React to a cached WhatsApp status/story."""
+        payload: Dict[str, Any] = {"statusMessageId": status_message_id, "emoji": emoji}
+        if status_author_jid:
+            payload["statusAuthorJid"] = status_author_jid
+        return await self._post_bridge_action("status-react", payload)
+
+    async def post_text_status(
+        self,
+        text: str,
+        status_jid_list: list[str],
+        background_color: Optional[str] = None,
+        font: Optional[int] = None,
+    ) -> SendResult:
+        """Post a WhatsApp text status/story to an explicit recipient list."""
+        payload: Dict[str, Any] = {"text": text, "statusJidList": status_jid_list}
+        if background_color:
+            payload["backgroundColor"] = background_color
+        if font is not None:
+            payload["font"] = font
+        return await self._post_bridge_action("post-status", payload)
+
     async def send_image(
         self,
         chat_id: str,
@@ -991,7 +1081,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         try:
             local_path = await cache_image_from_url(image_url)
-            return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
+            return await self._send_media_to_bridge(chat_id, local_path, "image", caption, reply_to=reply_to)
         except Exception:
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
 
@@ -1004,7 +1094,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file natively via bridge."""
-        return await self._send_media_to_bridge(chat_id, image_path, "image", caption)
+        return await self._send_media_to_bridge(chat_id, image_path, "image", caption, reply_to=reply_to)
 
     async def send_video(
         self,
@@ -1015,7 +1105,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video natively via bridge — plays inline in WhatsApp."""
-        return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
+        return await self._send_media_to_bridge(chat_id, video_path, "video", caption, reply_to=reply_to)
 
     async def send_voice(
         self,
@@ -1026,7 +1116,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an audio file as a WhatsApp voice message via bridge."""
-        return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
+        return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption, reply_to=reply_to)
 
     async def send_document(
         self,
@@ -1041,6 +1131,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return await self._send_media_to_bridge(
             chat_id, file_path, "document", caption,
             file_name or os.path.basename(file_path),
+            reply_to=reply_to,
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -1347,6 +1438,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 source=source,
                 raw_message=data,
                 message_id=data.get("messageId"),
+                reply_to_message_id=data.get("quotedMessageId") or None,
+                reply_to_text=data.get("quotedText") or None,
                 media_urls=cached_urls,
                 media_types=media_types,
                 metadata=metadata,

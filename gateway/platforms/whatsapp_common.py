@@ -127,6 +127,19 @@ class WhatsAppBehaviorMixin:
         return normalized
 
     @staticmethod
+    def _is_status_broadcast_id(value: Optional[str]) -> bool:
+        """Return True for WhatsApp status/story pseudo-chats.
+
+        Distinct from :meth:`_is_broadcast_chat`: this matches *only* status
+        updates (Stories), not Channel/Newsletter or generic broadcast-list
+        JIDs.  Used to gate the opt-in status-ingest path so status primitives
+        (reply_to_status / react_to_status) can receive inbound statuses when
+        explicitly enabled, without re-opening Channel/Newsletter spam.
+        """
+        normalized = WhatsAppBehaviorMixin._normalize_whatsapp_id(value).lower()
+        return normalized in {"status@broadcast", "status@s.whatsapp.net"}
+
+    @staticmethod
     def _is_broadcast_chat(chat_id: str) -> bool:
         """True for WhatsApp pseudo-chats that aren't real conversations.
 
@@ -329,6 +342,24 @@ class WhatsAppBehaviorMixin:
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         chat_id_raw = str(data.get("chatId") or "")
+        # WhatsApp Status updates (Stories) are inbound-only pseudo-chats that
+        # are normally dropped by ``_is_broadcast_chat`` below.  They may be
+        # opted into via the ``statuses`` config (enabled=true + ingest=true)
+        # when the WhatsApp status primitives are in use, so the agent can
+        # privately reply to / react to a status.  Channel/Newsletter and
+        # generic broadcast posts are never opted in here.
+        is_status = any(
+            self._is_status_broadcast_id(data.get(field))
+            for field in ("chatId", "from", "senderId")
+        )
+        if is_status:
+            statuses_cfg = (self.config.extra or {}).get("statuses") or {}
+            if not (
+                statuses_cfg.get("enabled") is True
+                and statuses_cfg.get("ingest") is True
+            ):
+                return False
+            return True
         # WhatsApp uses pseudo-chats for Status updates (Stories) and
         # Channel/Newsletter broadcasts. These are not real conversations
         # and the agent should never reply to them — even in self-chat mode
