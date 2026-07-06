@@ -6173,11 +6173,11 @@ def get_codex_auth_status() -> Dict[str, Any]:
     # Check credential pool first — this is where `hermes auth` and
     # `hermes model` store device_code tokens.
     try:
-        from agent.credential_pool import load_pool
+        from agent.credential_pool import STATUS_EXHAUSTED, load_pool
         pool = load_pool("openai-codex")
         if pool and pool.has_credentials():
             entry = pool.select()
-            if entry is not None:
+            if entry is not None and getattr(entry, "last_status", None) != STATUS_EXHAUSTED:
                 api_key = (
                     getattr(entry, "runtime_api_key", None)
                     or getattr(entry, "access_token", "")
