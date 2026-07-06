@@ -26,6 +26,21 @@ from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 
 
+@pytest.fixture(autouse=True)
+def _isolate_permanent_allowlist(monkeypatch):
+    """Reset _permanent_approved so real host config can't leak into tests.
+
+    tools/approval.py calls load_permanent_allowlist() at import time, which
+    reads command_allowlist from the real ~/.hermes/config.yaml before any
+    per-test HERMES_HOME fixture can apply. On a machine whose real config
+    already has 'execute_code' permanently approved (a genuine prior user
+    'always approve' choice, not test data), is_approved() would silently
+    return True from the permanent-allowlist check alone for every test in
+    this file that never expects execute_code to be pre-approved.
+    """
+    monkeypatch.setattr(A, "_permanent_approved", set())
+
+
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------

@@ -358,6 +358,16 @@ def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
             "expires_at_ms": 1775640710946,
         },
     )
+    # credential_pool.load_pool('qwen-oauth') independently imports and calls
+    # hermes_cli.auth.resolve_qwen_runtime_credentials to seed the pool from
+    # ~/.qwen/oauth_creds.json (the real Qwen CLI's token file). That's a
+    # second, separate call site from the one patched above, so on a machine
+    # with real (or leftover test) Qwen CLI credentials on disk, the pool
+    # entry silently wins over the mocked qwen-oauth branch's return value.
+    # Force an empty pool so this test exercises the direct
+    # resolve_qwen_runtime_credentials() path deterministically, regardless
+    # of what's sitting in ~/.qwen/oauth_creds.json on the machine running it.
+    monkeypatch.setattr(rp, "load_pool", lambda *a, **k: None)
 
     resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
 
@@ -412,6 +422,11 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
         "resolve_qwen_runtime_credentials",
         lambda **kw: (_ for _ in ()).throw(AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")),
     )
+    # See test_resolve_runtime_provider_qwen_oauth's comment: load_pool()
+    # seeds from the real ~/.qwen/oauth_creds.json via its own independent
+    # import of resolve_qwen_runtime_credentials, bypassing the mock above
+    # entirely if real/leftover Qwen CLI credentials exist on disk.
+    monkeypatch.setattr(rp, "load_pool", lambda *a, **k: None)
     monkeypatch.setattr(rp, "_get_model_config", lambda: {})
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
 

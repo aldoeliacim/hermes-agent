@@ -1076,11 +1076,21 @@ class TestPatternKeyUniqueness:
         _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
         session = "test_find_collision"
         _clear_session(session)
-        approve_session(session, key_exec)
-        assert is_approved(session, key_exec) is True
-        assert is_approved(session, key_delete) is False, (
-            "approving find -exec rm should not auto-approve find -delete"
-        )
+        # tools/approval.py calls load_permanent_allowlist() at import time,
+        # which reads the real ~/.hermes/config.yaml's command_allowlist
+        # before any per-test HERMES_HOME fixture can apply. On a machine
+        # whose real config already has 'find -delete' permanently approved
+        # (a genuine prior user approval, not test data), is_approved()
+        # would return True from the permanent-allowlist check alone,
+        # regardless of the session-scoped approval under test here. Isolate
+        # from that real state the same way the two legacy-key tests below
+        # already do for their own permanent-allowlist assertions.
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            approve_session(session, key_exec)
+            assert is_approved(session, key_exec) is True
+            assert is_approved(session, key_delete) is False, (
+                "approving find -exec rm should not auto-approve find -delete"
+            )
         _clear_session(session)
 
     def test_legacy_find_key_still_approves_find_exec(self):

@@ -155,8 +155,13 @@ class TestCallerIntegration:
 
     @patch("hermes_cli.copilot_auth.resolve_copilot_token", return_value=("gho_raw", "GH_TOKEN"))
     @patch("hermes_cli.copilot_auth.get_copilot_api_token", return_value=("exchanged_jwt", None))
-    def test_auth_resolve_uses_exchange(self, mock_exchange, mock_resolve):
+    def test_auth_resolve_uses_exchange(self, mock_exchange, mock_resolve, monkeypatch):
         from hermes_cli.auth import _resolve_api_key_provider_secret
+
+        # is_provider_explicitly_configured('copilot') gates this whole path
+        # (see auth.py) so a bare token doesn't silently opt a user into
+        # Copilot; simulate real explicit configuration here.
+        monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
 
         # Create a minimal pconfig mock
         pconfig = MagicMock()

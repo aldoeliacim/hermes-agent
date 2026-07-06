@@ -370,6 +370,12 @@ class TestApiKeyProviderStatus:
         assert status["base_url"] == STEPFUN_STEP_PLAN_CN_BASE_URL
 
     def test_copilot_status_uses_gh_cli_token(self, monkeypatch):
+        # is_provider_explicitly_configured('copilot') gates the whole
+        # resolution path (see auth.py's _resolve_api_key_provider_secret) so
+        # a stray GITHUB_TOKEN from git/gh/CI never falsely opts a user into
+        # Copilot. Simulate real explicit configuration via auth.json's
+        # active_provider rather than weakening/bypassing that gate.
+        monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_gh_cli_token")
         status = get_api_key_provider_status("copilot")
         assert status["configured"] is True
@@ -425,6 +431,7 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "GLM_API_KEY"
 
     def test_resolve_copilot_with_github_token(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
         monkeypatch.setenv("GITHUB_TOKEN", "gh-env-secret")
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"
@@ -433,6 +440,7 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "GITHUB_TOKEN"
 
     def test_resolve_copilot_with_gh_cli_fallback(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"
@@ -745,6 +753,7 @@ class TestHasAnyProviderConfigured:
 
     def test_gh_cli_token_counts(self, monkeypatch, tmp_path):
         from hermes_cli import config as config_module
+        monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

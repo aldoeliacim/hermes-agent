@@ -4064,6 +4064,21 @@ class TestRunConversation:
         agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
+        # agent._primary_runtime is snapshotted once at AIAgent.__init__ (see
+        # agent_init.py) and never re-snapshotted per-turn. Tests in this
+        # class routinely override agent.provider/model/base_url directly
+        # after construction to simulate a specific provider scenario —
+        # without resetting the snapshot, restore_primary_runtime's
+        # _live_state_diverges_from_primary() sees the manually-set live
+        # state as "diverged from primary" (since the snapshot still holds
+        # the empty/default values from construction) and incorrectly fires
+        # its self-heal path, silently replacing the test's mocked
+        # agent.client with a REAL OpenAI client mid-conversation. Resetting
+        # to {} disables the divergence check entirely (matching the
+        # established pattern in test_switch_model_context.py,
+        # test_switch_model_rollback.py, and other sibling test files that
+        # manually mutate agent runtime state).
+        agent._primary_runtime = {}
 
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
@@ -7586,6 +7601,12 @@ class TestReasoningReplayForStrictProviders:
         agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
+        # See TestRunConversation._setup_agent's comment: these tests
+        # override agent.provider/base_url after construction, which without
+        # resetting _primary_runtime makes restore_primary_runtime's
+        # divergence check incorrectly fire and replace the mocked
+        # agent.client with a real OpenAI client mid-conversation.
+        agent._primary_runtime = {}
 
     def test_kimi_tool_replay_includes_space_reasoning_content(self, agent):
         self._setup_agent(agent)
