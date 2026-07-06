@@ -35,6 +35,45 @@ def _git_init(path):
         subprocess.run([shutil.which("git"), "-C", str(path), *args], check=True, env=env)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_marker_walk_from_real_host_state(monkeypatch, tmp_path):
+    """Bound _marker_root/_git_root's upward directory walk to tmp_path's tree.
+
+    Both walkers climb real ancestor directories (capped at depth 6) looking
+    for project markers or a .git dir. That walk can reach genuine host state
+    that has nothing to do with a test's synthetic workspace — this box, for
+    example, has real /AGENTS.md and /CLAUDE.md at the filesystem root (both
+    are project markers per _PROJECT_MARKERS), so any tmp_path shallow enough
+    to reach '/' within the depth cap gets falsely detected as a code
+    workspace. Wrap both walkers so a hit outside tmp_path's own tree is
+    treated the same as "no marker found", matching every other machine that
+    doesn't happen to have marker files sitting at its filesystem root.
+    """
+    real_marker_root = cc._marker_root
+    real_git_root = cc._git_root
+    root = tmp_path.resolve()
+
+    def _within_tmp(path):
+        if path is None:
+            return False
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return path == root
+
+    def _bounded_marker_root(cwd):
+        result = real_marker_root(cwd)
+        return result if _within_tmp(result) else None
+
+    def _bounded_git_root(cwd):
+        result = real_git_root(cwd)
+        return result if _within_tmp(result) else None
+
+    monkeypatch.setattr(cc, "_marker_root", _bounded_marker_root)
+    monkeypatch.setattr(cc, "_git_root", _bounded_git_root)
+
+
 # ── resolver ──────────────────────────────────────────────────────────────
 
 class TestIsCodingContext:

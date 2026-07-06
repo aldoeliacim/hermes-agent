@@ -361,6 +361,13 @@ class TestDockerHostBindApproval:
     def test_host_bound_docker_requires_approval(self, monkeypatch):
         """Host-bound Docker dangerous command escalates instead of bypassing."""
         import tools.approval as A
+        # tools/approval.py's load_permanent_allowlist() runs at import time
+        # and reads the real ~/.hermes/config.yaml's command_allowlist. A host
+        # whose real config already permanently approves the matched pattern
+        # (e.g. "recursive delete"/"delete in root path") would make this
+        # approval-required assertion fail via the permanent-allowlist check
+        # alone, independent of the host-bind escalation path under test.
+        monkeypatch.setattr(A, "_permanent_approved", set())
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
@@ -382,6 +389,10 @@ class TestDockerHostBindApproval:
     def test_execute_code_host_bound_docker_requires_approval(self, monkeypatch):
         """Host-bound Docker execute_code does not get the container fast-path."""
         import tools.approval as A
+        # See test_host_bound_docker_requires_approval's comment: the real
+        # ~/.hermes/config.yaml's permanent execute_code allowlist entry
+        # would otherwise short-circuit this approval-required assertion.
+        monkeypatch.setattr(A, "_permanent_approved", set())
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         res = A.check_execute_code_guard(
             "import os; os.system('rm -rf /workspace')", "docker",

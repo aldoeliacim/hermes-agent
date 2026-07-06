@@ -11,6 +11,24 @@ from unittest.mock import patch
 
 import pytest
 
+# Force a real import of agent.display at module-collection time, before any
+# test in this file gets a chance to patch agent.redact.redact_sensitive_text.
+# agent/display.py does `from agent.redact import redact_sensitive_text` at
+# its own module level — a one-time binding into agent.display's namespace
+# that a later patch of agent.redact's attribute cannot retroactively fix.
+# Two tests below (test_tui_verbose_tool_details_fail_closed_when_redaction_fails,
+# test_tui_verbose_tool_events_omit_details_when_redaction_fails) patch
+# agent.redact.redact_sensitive_text to simulate a redaction failure; without
+# this early import, tui_gateway.server._on_tool_start's lazy
+# `from agent.display import capture_local_edit_snapshot` could trigger
+# agent.display's FIRST-EVER import while the patch is still active, baking
+# the fake fail_redaction permanently into agent.display's namespace and
+# leaking it into every later test in the process that calls
+# agent.display.redact_tool_args_for_display (observed breaking
+# TestConcurrentToolExecution in tests/run_agent/test_run_agent.py when this
+# file ran first in the same pytest session).
+import agent.display  # noqa: F401
+
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
@@ -316,13 +334,23 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
 
 
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
-
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
-    setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
+    # Patch the real agent.redact module's attribute in place (reliably
+    # reverted by monkeypatch) rather than swapping the whole module object
+    # via sys.modules. agent/display.py does `from agent.redact import
+    # redact_sensitive_text` at import time, binding its own private copy of
+    # the name — a sys.modules swap only affects *future* fresh imports, not
+    # that already-bound reference, and (worse) can leave agent.display's
+    # binding pointed at a stale fake module if agent.display happens to get
+    # (re-)imported anywhere while the swap is active, permanently leaking
+    # fail_redaction into every subsequent test in the same process that
+    # exercises redact_tool_args_for_display (e.g. TestConcurrentToolExecution
+    # in tests/run_agent/test_run_agent.py, which calls it via
+    # execute_tool_calls_sequential/get_cute_tool_message_impl and started
+    # failing with this exact RuntimeError once this file ran first).
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", fail_redaction)
 
     assert server._redact_tui_verbose_text("api_key=secret") == ""
     assert server._tool_args_text({"api_key": "secret"}) == ""
@@ -355,13 +383,14 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
 
 
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
-
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
-    setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
+    # See test_tui_verbose_tool_details_fail_closed_when_redaction_fails's
+    # comment: patch the real module attribute in place instead of swapping
+    # sys.modules, which can leak a fake agent.redact module into other
+    # tests/files that import agent.display in the same pytest process.
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", fail_redaction)
 
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -6435,7 +6464,37 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
     assert verification["evidence"]["scope"] == "full"
 
 
-def test_verification_status_outside_workspace_is_not_applicable(tmp_path):
+def test_verification_status_outside_workspace_is_not_applicable(tmp_path, monkeypatch):
+    # agent.coding_context._marker_root/_git_root walk real ancestor
+    # directories (capped at depth 6) looking for project markers or a .git
+    # dir. This box has real /AGENTS.md and /CLAUDE.md sitting at the
+    # filesystem root (both are project markers), so tmp_path — shallow
+    # enough under /tmp/pytest-of-.../... to reach '/' within the depth cap
+    # — gets falsely detected as inside a workspace, and verification_status
+    # proceeds to compute a real status instead of the not_applicable this
+    # test expects for a bare, non-workspace tmp dir. Bound both walkers to
+    # tmp_path's own tree, matching the isolation fixture in
+    # tests/agent/test_coding_context.py for the same underlying cause.
+    from agent import coding_context as cc
+
+    real_marker_root = cc._marker_root
+    real_git_root = cc._git_root
+    root = tmp_path.resolve()
+
+    def _within_tmp(path):
+        if path is None:
+            return False
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return path == root
+
+    monkeypatch.setattr(cc, "_marker_root",
+                         lambda cwd: (lambda r: r if _within_tmp(r) else None)(real_marker_root(cwd)))
+    monkeypatch.setattr(cc, "_git_root",
+                         lambda cwd: (lambda r: r if _within_tmp(r) else None)(real_git_root(cwd)))
+
     home = tmp_path / ".hermes"
     home.mkdir()
     token = set_hermes_home_override(home)

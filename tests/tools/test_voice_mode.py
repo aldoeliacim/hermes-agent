@@ -134,6 +134,15 @@ class TestDetectAudioEnvironment:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        # hermes_constants.is_container() caches its result for the process
+        # lifetime and detects containerd/docker markers in /proc/self/
+        # mountinfo — real signals on any host that also runs Docker/
+        # containerd workloads alongside this test process (not necessarily
+        # inside a container itself). Force the "clean host" case explicitly
+        # instead of relying on the ambient truth of whatever machine runs
+        # this test, matching the sibling Docker tests below that already
+        # mock this the other way for their own explicit-container case.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
         monkeypatch.setattr("builtins.open", _non_wsl_proc_version(open))
@@ -424,6 +433,12 @@ class TestDetectAudioEnvironment:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        # See test_clean_environment_is_available's comment: a Termux/Android
+        # environment is not a container, but is_container()'s host-level
+        # docker/containerd mount-table detection can still fire on a machine
+        # that happens to run container workloads elsewhere. Force it False
+        # explicitly rather than relying on ambient host truth.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
         monkeypatch.setattr("tools.voice_mode.shutil.which", lambda cmd: "/data/data/com.termux/files/usr/bin/termux-microphone-record" if cmd == "termux-microphone-record" else None)
         monkeypatch.setattr("tools.voice_mode._termux_api_app_installed", lambda: True)
         monkeypatch.setattr("tools.voice_mode._import_audio", lambda: (_ for _ in ()).throw(ImportError("no audio libs")))
