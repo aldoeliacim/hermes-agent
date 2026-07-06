@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 .venv
 .vscode/
+.serena/
 .env
 .op.env
 .env.local
