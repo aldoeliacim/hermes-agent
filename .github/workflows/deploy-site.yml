@@ -39,7 +39,11 @@ jobs:
     # main commit needs to ship live before the next release tag — e.g.
     # a skills-index PR that doesn't touch website/** paths and so
     # doesn't auto-deploy via the deploy-docs path.
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    #
+    # Guarded to the canonical repo only (mirrors deploy-docs' existing
+    # guard below) — this fork has no VERCEL_DEPLOY_HOOK secret and must
+    # never attempt to deploy Nous's production docs site.
+    if: (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Vercel Deploy

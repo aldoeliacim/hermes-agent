@@ -1,0 +1,121 @@
+name: Fork Drift Report (vs NousResearch/hermes-agent)
+
+# Personal-fork automation: this workflow only makes sense on
+# aldoeliacim/hermes-agent, a patch-stack mirror of the canonical
+# NousResearch/hermes-agent. It has no upstream equivalent and should never
+# run on the canonical repo (guarded below), so merging nous/main in here
+# will never accidentally resurrect it there.
+#
+# What it does: fetches the canonical repo as a throwaway remote, diffs it
+# against this fork's main, and keeps a single tracking issue up to date with
+# how many commits this fork is ahead/behind and what the unmerged upstream
+# commits are. This is the repo-native counterpart to the local
+# `hermes-repo-monitor.py` cron job (which reports the same drift as a daily
+# WhatsApp message) — the issue gives a durable, always-queryable record that
+# doesn't depend on the Hermes gateway being up, and is visible to anyone
+# with fork access via the Issues tab rather than only in chat history.
+#
+# Detection-only: never opens a PR, never cherry-picks, never merges anything
+# automatically. A human (or an explicitly-invoked agent session) decides
+# when and how to reconcile the drift.
+
+on:
+  schedule:
+    # Weekly, Sunday 09:00 UTC — cheap enough to also run manually anytime.
+    - cron: "0 9 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift-report:
+    if: github.repository == 'aldoeliacim/hermes-agent'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch canonical upstream
+        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git main:refs/remotes/nous-upstream/main
+
+      - name: Compute drift
+        id: drift
+        run: |
+          BEHIND=$(git rev-list --count HEAD..nous-upstream/main)
+          AHEAD=$(git rev-list --count nous-upstream/main..HEAD)
+          {
+            echo "behind=$BEHIND"
+            echo "ahead=$AHEAD"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "commits<<EOF"
+            if [ "$BEHIND" -gt 0 ]; then
+              # shellcheck disable=SC2016  # %h/%H/%s/%an are git pretty-format
+              # placeholders, not shell variables — single quotes are intentional.
+              git log --pretty=format:'- [`%h`](https://github.com/NousResearch/hermes-agent/commit/%H) %s (%an)' HEAD..nous-upstream/main | head -200
+            else
+              echo "_(none — fork is fully caught up with upstream main)_"
+            fi
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find existing tracking issue
+        id: find_issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUM=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --search 'in:title "Fork drift report" in:comments' \
+            --state open \
+            --json number,title \
+            --jq '.[] | select(.title == "Fork drift report (vs NousResearch/hermes-agent)") | .number' \
+            | head -1)
+          echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Update or create tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          COMMITS: ${{ steps.drift.outputs.commits }}
+        run: |
+          BODY_FILE=$(mktemp)
+          {
+            echo "Automated weekly diff between this fork's \`main\` and"
+            echo "[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)'s \`main\`."
+            echo "Detection-only — nothing here merges or cherry-picks automatically."
+            echo ""
+            echo "**Last updated:** $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "**Behind upstream:** $BEHIND commit(s) not yet on this fork"
+            echo "**Ahead of upstream:** $AHEAD commit(s) local-only (your own patch stack)"
+            echo ""
+            echo "<details><summary>Unmerged upstream commits ($BEHIND)</summary>"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "</details>"
+          } > "$BODY_FILE"
+
+          if [ -n "${{ steps.find_issue.outputs.number }}" ]; then
+            gh issue edit "${{ steps.find_issue.outputs.number }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file "$BODY_FILE"
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Fork drift report (vs NousResearch/hermes-agent)" \
+              --body-file "$BODY_FILE" \
+              --label "automation" 2>&1 || \
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Fork drift report (vs NousResearch/hermes-agent)" \
+              --body-file "$BODY_FILE"
+          fi
