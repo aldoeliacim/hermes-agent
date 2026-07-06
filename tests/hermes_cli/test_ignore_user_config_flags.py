@@ -66,9 +66,23 @@ class TestIgnoreUserConfigEnvGate:
         (tmp_path / "config.yaml").write_text(config_yaml)
 
     def _reload_cli(self, monkeypatch, tmp_path):
-        """Point cli._hermes_home at tmp_path and return a fresh load_cli_config."""
+        """Point cli._hermes_home at tmp_path and return a fresh load_cli_config.
+
+        Also points cli.__file__ at an empty tmp directory so
+        load_cli_config()'s project-level fallback (``Path(__file__).parent /
+        'cli-config.yaml'``) resolves to a nonexistent file instead of this
+        repo's real, untracked, gitignored ``cli-config.yaml`` — which exists
+        on real dev checkouts as a genuine local project-level default and is
+        NOT something tmp_path/_hermes_home isolation alone can shadow.
+        Without this, tests asserting the *absence* of a specific model
+        string can spuriously fail/pass depending on what a given machine's
+        real cli-config.yaml happens to contain.
+        """
         import cli
         monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+        fake_module_dir = tmp_path / "_fake_cli_module_dir"
+        fake_module_dir.mkdir(exist_ok=True)
+        monkeypatch.setattr(cli, "__file__", str(fake_module_dir / "cli.py"))
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):

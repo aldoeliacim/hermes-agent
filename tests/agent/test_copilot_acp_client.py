@@ -292,6 +292,21 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # _iter_real_home_candidates prefers an explicit HERMES_REAL_HOME env var
+    # (os.getenv fallback) over HOME itself. This session is itself running
+    # inside live Hermes gateway infrastructure, which sets HERMES_REAL_HOME
+    # in its own real environment — that ambient value would otherwise win
+    # over the synthetic real_home this test constructs.
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    # get_subprocess_home's "auto" mode always prefers the profile home when
+    # is_container() is True — this box genuinely has real docker/containerd
+    # markers in /proc/self/mountinfo (it runs Docker workloads alongside
+    # this session), which is accurate host detection, not a bug. But this
+    # test's whole point (per its name) is the host-install branch: real
+    # HOME must win even though a profile home dir exists. Pin
+    # is_container() to False so the test exercises that branch
+    # deterministically instead of depending on ambient host truth.
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
 
     captured = {}
     client = _make_home_client(tmp_path)

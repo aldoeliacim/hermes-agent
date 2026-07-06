@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -56,8 +56,25 @@ def _make_runner():
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    # Configure a home channel matching _make_source()'s chat_id so
+    # _should_skip_user_profile_for_source (the owner gate that /approve's
+    # resolve path also checks) recognizes this fake session as the home/
+    # owner session, matching a real single-owner deployment. Without a
+    # configured home channel at all, that gate conservatively (and
+    # correctly, by design) treats EVERY contact as a non-owner and fails
+    # closed — which is what was silently denying every approval in this
+    # test file rather than an actual bug in the approval-resolution path
+    # under test.
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM, chat_id="c1", name="test-home",
+                ),
+            )
+        }
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()

@@ -15,6 +15,24 @@ Both fixed together by:
 
 import threading
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_permanent_allowlist(monkeypatch):
+    """Reset tools.approval._permanent_approved for tests in this file.
+
+    tools/approval.py calls load_permanent_allowlist() at import time, which
+    reads command_allowlist from the real ~/.hermes/config.yaml before any
+    per-test HERMES_HOME fixture can apply. On a machine whose real config
+    already has "recursive delete" permanently approved (a genuine prior
+    user 'always approve' choice, not test data), check_all_command_guards's
+    permanent-allowlist check auto-approves 'rm -rf ...' before ever
+    consulting the approval_callback under test here.
+    """
+    import tools.approval as _approval_module
+    monkeypatch.setattr(_approval_module, "_permanent_approved", set())
+
 
 
 class TestThreadLocalApprovalCallback:
