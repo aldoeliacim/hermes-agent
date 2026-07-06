@@ -71,9 +71,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Search open issues by exact title (GitHub search doesn't reliably
+          # support combining multiple `in:` qualifiers on one term, so keep
+          # this simple: list open issues and match the title client-side).
           ISSUE_NUM=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
-            --search 'in:title "Fork drift report" in:comments' \
             --state open \
             --json number,title \
             --jq '.[] | select(.title == "Fork drift report (vs NousResearch/hermes-agent)") | .number' \
