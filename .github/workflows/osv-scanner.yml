@@ -36,6 +36,13 @@ permissions:
 jobs:
   scan:
     name: Scan lockfiles
+    # SARIF upload requires GitHub Advanced Security, which is free on public
+    # repos but a paid add-on on private ones. This fork is private, so the
+    # upstream reusable workflow's SARIF-upload step fails with
+    # JOB_STATUS_CONFIGURATION_ERROR every run — skip here rather than churn
+    # on a permanently-red, non-actionable check. Re-enable by removing this
+    # guard if the fork visibility changes or Advanced Security is purchased.
+    if: github.repository == 'NousResearch/hermes-agent'
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
     with:
       # Scan explicit lockfiles rather than recursing, so we only look at

@@ -2,6 +2,13 @@ name: Publish to PyPI
 
 # Triggered by CalVer tag pushes from scripts/release.py (e.g. v2026.5.15)
 # Can also be triggered manually from the Actions tab as an escape hatch.
+#
+# DISABLED on this fork (aldoeliacim/hermes-agent): this is a personal patch-
+# stack mirror, not the canonical hermes-agent PyPI package — it must never
+# publish to PyPI under any circumstances. The trigger conditions are kept
+# byte-identical to upstream so future `git merge nous/main` stays clean;
+# only the `if: false` guards below are fork-local and deliberately NOT
+# something upstream merges should ever remove silently.
 on:
   push:
     tags:
@@ -25,6 +32,7 @@ concurrency:
 jobs:
   build:
     name: Build distribution 📦
+    if: false # DISABLED on this fork — see header comment.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
