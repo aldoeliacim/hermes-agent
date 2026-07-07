@@ -101,7 +101,11 @@ jobs:
         env:
           HEAD_REF: ${{ inputs.event_name == 'pull_request' && github.head_ref || github.ref_name }}
         run: |
-          python scripts/lint_diff.py \
+          # Debian (used by the self-hosted runner) deliberately omits a bare
+          # `python` shim for python3 (PEP 394 leaves this to the distro);
+          # GitHub-hosted ubuntu-latest ships one. Use python3 explicitly so
+          # this job works on both.
+          python3 scripts/lint_diff.py \
             --base-ruff .lint-reports/base/ruff.json \
             --head-ruff .lint-reports/head/ruff.json \
             --base-ty   .lint-reports/base/ty.json \
@@ -151,10 +155,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
-        with:
-          python-version: "3.11"
-
       - name: Run footgun checker
-        run: python scripts/check-windows-footguns.py --all
+        # Pure-stdlib checker (see check-windows-footguns.py's own imports) —
+        # no repo deps needed, so the self-hosted runner's own system python3
+        # is sufficient. Skips setup-python entirely: that action's bundled
+        # CPython builds don't yet cover Debian 13 (Trixie), which this LXC
+        # runs (actions/setup-python errors "version 3.11 ... was not found
+        # for Debian 13" — GitHub-hosted ubuntu-latest doesn't hit this
+        # because it's on Ubuntu, not Debian).
+        run: python3 scripts/check-windows-footguns.py --all
+
