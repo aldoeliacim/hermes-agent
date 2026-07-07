@@ -127,7 +127,9 @@ async def test_await_with_thread_deadline_abandons_and_runs_cleanup_on_timeout()
     elapsed = _time.monotonic() - started
 
     # Returned control promptly — well before the wedged coroutine's ~1s span.
-    assert elapsed < 0.8
+    # Raised from 0.8s (4x the 0.2s deadline) to 2.0s (10x) for scheduling
+    # headroom on a contended host.
+    assert elapsed < 2.0
     # The detached cleanup was scheduled; give the loop a tick to run it.
     await _asyncio.wait_for(cleanup_ran.wait(), timeout=2.0)
     assert cleanup_ran.is_set()

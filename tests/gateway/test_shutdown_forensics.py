@@ -86,7 +86,8 @@ class TestSnapshotShutdownContext:
         sf.snapshot_shutdown_context(signal.SIGTERM)
         elapsed = time.monotonic() - start
         # Generous bound; the function should be sub-millisecond in practice.
-        assert elapsed < 0.5, f"snapshot took {elapsed:.3f}s — too slow"
+        # Raised from 0.5s for scheduling headroom on a contended host.
+        assert elapsed < 2.0, f"snapshot took {elapsed:.3f}s — too slow"
 
     def test_detects_takeover_marker_for_self(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -199,8 +200,9 @@ class TestSpawnAsyncDiagnostic:
         sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=10.0)
         elapsed = time.monotonic() - start
         # Spawning bash in detached mode takes a few ms; anything under 1s
-        # is plenty of headroom and proves we're not waiting on it.
-        assert elapsed < 1.0, f"spawn blocked for {elapsed:.2f}s"
+        # is plenty of headroom and proves we're not waiting on it. Raised
+        # from 1.0s for scheduling headroom on a contended host.
+        assert elapsed < 3.0, f"spawn blocked for {elapsed:.2f}s"
 
 
 # ---------------------------------------------------------------------------

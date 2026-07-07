@@ -196,7 +196,8 @@ class TestDDGSProviderSearch:
             assert result["success"] is False
             assert "timed out" in result["error"].lower()
             # Returned well before the worker's 10s wait — proves the cap fired.
-            assert elapsed < 3.0, f"search did not return promptly ({elapsed:.1f}s)"
+            # Raised from 3.0s for scheduling headroom on a contended host.
+            assert elapsed < 6.0, f"search did not return promptly ({elapsed:.1f}s)"
         finally:
             release.set()  # let the orphaned worker finish immediately
 

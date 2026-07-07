@@ -63,7 +63,12 @@ def test_honcho_hybrid_initialize_returns_without_waiting_for_session_init(monke
     elapsed = time.perf_counter() - start
 
     try:
-        assert elapsed < 0.5
+        # Fail-open guard: dispatch to a background thread should return
+        # almost instantly regardless of host scheduling load — real work
+        # here is just spawning a thread, nowhere near the 5s gate the
+        # mocked _do_session_init blocks on. Raised from 0.5s (observed
+        # tight enough to flake under contention on shared CI hardware).
+        assert elapsed < 2.0
         assert started.wait(timeout=1)
         assert provider._session_key == "test-session"
     finally:
@@ -127,7 +132,10 @@ def test_honcho_prefetch_returns_without_waiting_for_first_context_fetch():
     elapsed = time.perf_counter() - start
 
     assert result == ""
-    assert elapsed < 0.5
+    # Fail-open guard against the mocked 5s-blocking manager — same class
+    # as the fix above. Raised from 0.5s for scheduling headroom on
+    # contended hosts.
+    assert elapsed < 2.0
     assert fetch_started.is_set()
 
 

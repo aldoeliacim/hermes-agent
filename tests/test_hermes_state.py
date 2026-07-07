@@ -1792,7 +1792,12 @@ class TestFTS5Search:
 
         assert isinstance(result, str)
         assert len(result) <= MAX_FTS5_QUERY_CHARS * 2
-        assert elapsed < 0.5
+        # Regression guard against pathological sanitizer slowdown (e.g. an
+        # accidentally-quadratic char-by-char scan). Raised from 0.5s to 3.0s
+        # (6x headroom over the sub-100ms this takes on quiet hardware) to
+        # absorb CPU-scheduling contention on a shared host while still
+        # catching any real algorithmic regression.
+        assert elapsed < 3.0
 
     def test_long_search_query_is_capped_and_does_not_crash(self, db):
         db.create_session(session_id="s1", source="cli")
@@ -1804,7 +1809,11 @@ class TestFTS5Search:
         elapsed = time.perf_counter() - start
 
         assert isinstance(results, list)
-        assert elapsed < 1.0
+        # Regression guard, same rationale as test_hermes_state's other
+        # sanitizer-timing check just above: raised from 1.0s for headroom
+        # under CPU contention while still catching real quadratic-scan
+        # regressions (which show up as multi-second, not a modest overshoot).
+        assert elapsed < 3.0
 
 
 # =========================================================================

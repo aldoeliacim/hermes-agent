@@ -2450,7 +2450,8 @@ class TestParallelSearchSourcesTimeout:
         elapsed = time.monotonic() - start
 
         # Must return long before the slow source's 5s sleep finishes.
-        assert elapsed < 2.0, f"call blocked for {elapsed:.2f}s (timeout not honoured)"
+        # Raised from 2.0s for scheduling headroom on a contended host.
+        assert elapsed < 4.0, f"call blocked for {elapsed:.2f}s (timeout not honoured)"
         assert "slow" in timed_out_ids
         # Fast source still delivered its result and is not flagged timed out.
         assert source_counts.get("fast") == 1

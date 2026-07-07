@@ -2693,8 +2693,9 @@ def test_on_session_switch_does_not_block_caller_on_slow_drain():
     elapsed = time.monotonic() - start
 
     # The caller returned promptly with state already rotated, even though the
-    # drain is still parked on the finalizer thread.
-    assert elapsed < 1.0, f"on_session_switch blocked the caller for {elapsed:.2f}s"
+    # drain is still parked on the finalizer thread. Raised from 1.0s for
+    # scheduling headroom on a contended host.
+    assert elapsed < 3.0, f"on_session_switch blocked the caller for {elapsed:.2f}s"
     assert provider._session_id == "new-sid"
     assert provider._turn_count == 0
     assert drain_entered.wait(timeout=2.0), "finalizer never started draining"

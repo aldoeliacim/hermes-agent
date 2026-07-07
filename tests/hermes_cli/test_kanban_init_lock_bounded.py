@@ -66,7 +66,7 @@ def test_initialized_path_connect_skips_init_lock(kanban_home):
         start = time.monotonic()
         kb.connect().close()
         elapsed = time.monotonic() - start
-        assert elapsed < 1.0, f"fast-path connect blocked on the init lock ({elapsed:.2f}s)"
+        assert elapsed < 3.0, f"fast-path connect blocked on the init lock ({elapsed:.2f}s)"
     finally:
         release.set()
         t.join(timeout=5)

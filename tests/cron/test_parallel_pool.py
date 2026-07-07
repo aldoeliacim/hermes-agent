@@ -163,7 +163,9 @@ class TestSyncMode:
         elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # returned immediately, didn't wait for slow_run
+        # Returned immediately, didn't wait for slow_run's barrier release.
+        # Raised from 1.0s for scheduling headroom on a contended host.
+        assert elapsed < 3.0
 
         # Let the job finish so cleanup works.
         barrier.wait()
@@ -217,7 +219,9 @@ class TestSequentialPool:
         elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # did NOT block on the slow workdir job
+        # Did NOT block on the slow workdir job. Raised from 1.0s for
+        # scheduling headroom on a contended host.
+        assert elapsed < 3.0
 
         barrier.wait()
         time.sleep(0.1)

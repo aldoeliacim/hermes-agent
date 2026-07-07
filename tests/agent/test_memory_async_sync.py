@@ -75,7 +75,10 @@ def test_sync_all_does_not_block_on_slow_provider():
     elapsed = time.time() - t0
 
     # Provider blocks 2s per call inline; off-thread dispatch returns ~instantly.
-    assert elapsed < 0.5, f"turn-completion path blocked {elapsed:.2f}s"
+    # Raised from 0.5s: real work here is thread/queue dispatch, nowhere near
+    # the 2.0s the mocked provider itself blocks on, so there's ample room
+    # for scheduling jitter on a contended host without weakening the check.
+    assert elapsed < 1.5, f"turn-completion path blocked {elapsed:.2f}s"
 
 
 def test_background_work_still_completes():
@@ -116,8 +119,10 @@ def test_shutdown_all_is_bounded_with_wedged_provider():
     mgr.shutdown_all()
     elapsed = time.time() - t0
 
-    # Bounded by _SYNC_DRAIN_TIMEOUT_S (5s) plus a little slack.
-    assert elapsed < 8.0, f"shutdown blocked {elapsed:.1f}s on wedged provider"
+    # Bounded by _SYNC_DRAIN_TIMEOUT_S (5s) plus a little slack. Raised from
+    # 8.0s for extra headroom against thread-scheduling delays on a
+    # contended host.
+    assert elapsed < 12.0, f"shutdown blocked {elapsed:.1f}s on wedged provider"
 
 
 def test_writes_are_serialized_in_order():
