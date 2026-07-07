@@ -51,29 +51,68 @@ jobs:
         uses: ./.github/actions/detect-changes
 
   # ─────────────────────────────────────────────────────────────────────
+  # Self-hosted approval gate. The self-hosted LXC runner executes real code
+  # from the triggering ref, and a pull_request from the public fork can
+  # come from anyone — so PR runs must wait for a maintainer to approve the
+  # `self-hosted-approval` environment before any self-hosted job starts.
+  # Push (already-merged main) and workflow_dispatch are pre-trusted and
+  # skip this gate entirely (job is skipped, not blocked). Also skipped when
+  # neither of the lanes that use self-hosted runners (python, frontend)
+  # is affected — a docs-only PR shouldn't wait on manual approval for
+  # runners it will never touch.
+  # ─────────────────────────────────────────────────────────────────────
+  require-approval:
+    name: Approve self-hosted runner use
+    needs: detect
+    if: |
+      needs.detect.outputs.event_name == 'pull_request' &&
+      (needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true')
+    runs-on: ubuntu-latest
+    environment: self-hosted-approval
+    steps:
+      - run: echo "Self-hosted runner use approved for this PR."
+
+  # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
+  #
+  # tests/lint/typecheck gate on require-approval's *result*, not merely its
+  # existence: GitHub Actions only evaluates a job's `if` after every listed
+  # `needs` job has concluded, so on a PR awaiting approval these jobs stay
+  # blocked (not "skipped") until a reviewer acts — they can never slip
+  # through as a false "skipped == success" the way all-checks-pass treats
+  # genuinely-inapplicable lanes below.
   # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
+    needs: [detect, require-approval]
+    # require-approval is skipped (not run) on non-PR events, and a skipped
+    # dependency makes needs-based jobs skip by default too — so this must
+    # explicitly allow that case through rather than relying on bare
+    # needs.detect.outputs.python == 'true'.
+    if: |
+      always() && needs.detect.outputs.python == 'true' &&
+      (needs.detect.outputs.event_name != 'pull_request' || needs.require-approval.result == 'success')
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 8
 
   lint:
     name: Python lints
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
+    needs: [detect, require-approval]
+    if: |
+      always() && needs.detect.outputs.python == 'true' &&
+      (needs.detect.outputs.event_name != 'pull_request' || needs.require-approval.result == 'success')
     uses: ./.github/workflows/lint.yml
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
 
   typecheck:
     name: TypeScript
-    needs: detect
-    if: needs.detect.outputs.frontend == 'true'
+    needs: [detect, require-approval]
+    if: |
+      always() && needs.detect.outputs.frontend == 'true' &&
+      (needs.detect.outputs.event_name != 'pull_request' || needs.require-approval.result == 'success')
     uses: ./.github/workflows/typecheck.yml
 
   docs-site:

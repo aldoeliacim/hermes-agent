@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # Custom label used by the dedicated self-hosted runner (see
+  # .github/workflows/ci.yml's require-approval gate + tests.yml/lint.yml/
+  # typecheck.yml). Declared here so `actionlint` doesn't flag it as an
+  # unknown runner label.
+  labels:
+    - hermes-agent
