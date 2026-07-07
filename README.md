@@ -261,3 +261,5 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+<!-- runner verification 2026-07-07T05:12:51Z -->
