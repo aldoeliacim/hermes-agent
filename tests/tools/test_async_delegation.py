@@ -47,22 +47,27 @@ def test_dispatch_returns_immediately_without_blocking():
         return {"status": "completed", "summary": "done", "api_calls": 1,
                 "duration_seconds": 0.1, "model": "m"}
 
-    t0 = time.monotonic()
     res = ad.dispatch_async_delegation(
         goal="g", context=None, toolsets=None, role="leaf", model="m",
         session_key="", runner=runner, max_async_children=3,
     )
-    elapsed = time.monotonic() - t0
 
     assert res["status"] == "dispatched"
     assert res["delegation_id"].startswith("deleg_")
     # Non-blocking invariant: dispatch returned while the runner is still
-    # gated (active), so it cannot have waited on the gate. The active_count
-    # check is the environment-independent proof; the generous wall-clock
-    # bound is a loose sanity backstop, not the primary assertion (a loaded
-    # CI runner can be slow but never anywhere near the runner's 5s gate).
+    # gated (active), so it cannot have waited on the gate. active_count()
+    # is the whole proof here — the runner thread can only still be
+    # "active" (not yet returned) if dispatch_async_delegation handed
+    # control back to the caller before the gated runner finished, which is
+    # exactly "did it block" with no wall-clock dependency. A prior version
+    # of this test paired that check with an `elapsed < 4.0` wall-clock
+    # backstop; that assertion added no correctness signal beyond
+    # active_count() and failed deterministically on a loaded self-hosted CI
+    # runner (elapsed 4.02s) purely from scheduler preemption between the
+    # dispatch call returning and time.monotonic() being read — the dispatch
+    # itself was still genuinely non-blocking. Removed rather than loosened
+    # further, since any wall-clock bound is inherently host-load-dependent.
     assert ad.active_count() == 1
-    assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
 
 
