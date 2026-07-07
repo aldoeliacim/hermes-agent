@@ -151,7 +151,20 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            # Deadlock guard only — this fully mocked run (fake agent, fake
+            # session store, fake stream consumer; no real network/API
+            # calls) has no legitimate reason to take anywhere near this
+            # long. It's a hang backstop, not a speed assertion: the test's
+            # correctness comes entirely from the returned result's
+            # contents, not from how quickly it arrived. Was 2s, which
+            # failed deterministically on a loaded self-hosted CI runner
+            # (3 test runners + org traffic sharing one host) — same root
+            # cause as the discord/async_delegation wall-clock flakes fixed
+            # alongside this. Raised rather than removed since there's no
+            # environment-independent proxy assertion available here (unlike
+            # active_count() in the async_delegation case): we genuinely
+            # need the coroutine to finish before asserting on its result.
+            timeout=30,
         )
     )
 
