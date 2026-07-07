@@ -479,7 +479,18 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
         capture_output=True,
         text=True,
         cwd=str(_WORKTREE),
-        timeout=30,
+        # Deadlock guard, not a performance assertion: this spawns a real
+        # subprocess that imports the whole hermes_cli.main module tree from
+        # scratch, which is dominated by process-startup + import time, not
+        # algorithmic work. On a shared, heavily-loaded host (e.g. a
+        # self-hosted CI runner with several concurrent test-suite runs
+        # competing for CPU) that startup can genuinely take much longer
+        # than on quiet hardware without anything being wrong — observed
+        # tripping the old 30s bound under exactly that contention. 90s
+        # still fails hard on a genuine hang (an actually-broken CLI
+        # command that never returns) while giving real headroom for slow
+        # process spin-up under load.
+        timeout=90,
     )
 
 
