@@ -471,12 +471,23 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
     monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
     monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
 
-    ok = await asyncio.wait_for(adapter.connect(), timeout=1.0)
+    # These waits are pure asyncio.Event signals (the mock bot's on_ready
+    # fires synchronously inside client.start(), and SlowSyncTree.sync's
+    # side_effect sets `started` immediately) — correct code resolves them
+    # near-instantly regardless of host load. A tight assertion-style
+    # timeout here doesn't test anything the events themselves don't
+    # already guarantee; it just makes the test flaky under scheduling
+    # contention on a busy host (observed failing deterministically on a
+    # loaded self-hosted CI runner). Use a generous deadlock-only guard
+    # instead — large enough that only a genuine hang trips it, so the
+    # test still fails fast on a real regression without depending on
+    # wall-clock timing for a correctness assertion.
+    ok = await asyncio.wait_for(adapter.connect(), timeout=30.0)
 
     assert ok is True
     assert adapter._ready_event.is_set()
 
-    await asyncio.wait_for(created["bot"].tree.started.wait(), timeout=1.0)
+    await asyncio.wait_for(created["bot"].tree.started.wait(), timeout=30.0)
     assert created["bot"].tree.sync.await_count == 1
 
     created["bot"].tree.allow_finish.set()
