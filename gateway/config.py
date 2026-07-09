@@ -1135,10 +1135,23 @@ def load_gateway_config() -> GatewayConfig:
                     "filter_silence_narration"
                 ]
 
+            # reply_gate_mode / reply_gate_tool_fallback: top-level wins;
+            # nested gateway.* fallback (matches the gateway.streaming /
+            # write_sessions_json precedence pattern). Without the nested
+            # fallback, a config.yaml that writes these under the `gateway:`
+            # block — the layout `hermes config set gateway.reply_gate_mode`
+            # actually produces — is silently ignored and the feature stays
+            # on its "prompt" default despite the file appearing to opt in.
             if "reply_gate_mode" in yaml_cfg:
                 gw_data["reply_gate_mode"] = yaml_cfg["reply_gate_mode"]
+            elif isinstance(_gw_section, dict) and "reply_gate_mode" in _gw_section:
+                gw_data["reply_gate_mode"] = _gw_section["reply_gate_mode"]
             if "reply_gate_tool_fallback" in yaml_cfg:
                 gw_data["reply_gate_tool_fallback"] = yaml_cfg[
+                    "reply_gate_tool_fallback"
+                ]
+            elif isinstance(_gw_section, dict) and "reply_gate_tool_fallback" in _gw_section:
+                gw_data["reply_gate_tool_fallback"] = _gw_section[
                     "reply_gate_tool_fallback"
                 ]
 

@@ -478,6 +478,34 @@ class TestLoadGatewayConfig:
 
         assert config.multiplex_profiles is True
 
+    def test_reply_gate_mode_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        """``gateway.reply_gate_mode: tool`` (the nested form written by
+        ``hermes config set gateway.reply_gate_mode tool``) must actually
+        enable tool-gated delivery when loaded via load_gateway_config().
+
+        Regression: the reply_gate_mode / reply_gate_tool_fallback block only
+        read the *top-level* yaml_cfg keys into gw_data (unlike its sibling
+        write_sessions_json, which already had the nested gateway.* fallback).
+        A config.yaml that nests these under `gateway:` — as Aldo's live
+        config.yaml did during the July 2026 reply-gate burn-in — silently
+        fell back to reply_gate_mode="prompt", so the tool-gated delivery
+        inversion never activated despite three days of "live" burn-in.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n  reply_gate_mode: tool\n  reply_gate_tool_fallback: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.reply_gate_mode == "tool"
+        assert config.reply_gate_tool_fallback is False
+
     def test_relay_platform_enabled_from_env_url(self, tmp_path, monkeypatch):
         """GATEWAY_RELAY_URL must enable Platform.RELAY in config.platforms so
         start_gateway()'s connect loop actually dials the connector. Registering
