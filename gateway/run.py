@@ -11939,10 +11939,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # mutated during the turn. Drives dedup regardless of tool_gated.
             _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
             _delivered_via_tool = _tool_send_count > 0
-            # Was the RAW final text (before empty-normalization) a substantive
-            # answer? Gates the fallback ratchet so it never rescues an empty
-            # tail into a manufactured placeholder.
-            _had_substantive_tail = bool(response.strip()) and not _intentional_silence
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -12444,37 +12440,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # applies independently of the mode). This runs AFTER transcript
             # persistence (above) and only suppresses platform delivery, never
             # the transcript — mirroring the intentional-silence contract.
+            #
+            # Three-way DECISION outcome (not a binary deliver/suppress):
+            # the model must EXPLICITLY choose reply (send_message(target=
+            # "current", ...)) or silent (send_message(target="current",
+            # action="silent")). There is no longer a fallback that
+            # auto-delivers a substantive-looking tail when neither call
+            # happened — that ratchet (reply_gate_tool_fallback) treated an
+            # accident (the model just producing free text) the same as a
+            # deliberate decision, which is exactly backwards: it let the
+            # model skip deciding and still get delivery, so the emoji/
+            # reaction over-reply class (see whatsapp-group-participation
+            # skill) never actually got the structural pressure to be more
+            # selective. Silence is still the outcome when nothing was
+            # decided, but it is logged as a DISTINCT "undecided" outcome —
+            # never merged into "silent" — so a model that never learns to
+            # call the tool is visible in telemetry, not invisibly "working."
             if tool_gated or _delivered_via_tool:
+                _decided_silent = int(
+                    getattr(source, "reply_gate_decided_silent", 0) or 0
+                ) > 0
                 if _delivered_via_tool:
                     # Dedup (defense in depth): a tool-driven send already
                     # delivered to this chat, so the free-text tail must never
                     # ALSO auto-deliver — a duplicate is always wrong.
                     _reply_gate_suppress = True
-                    _reply_gate_fallback = False
-                elif not _had_substantive_tail:
-                    # Empty or silence-marker tail with no tool send — nothing to
-                    # deliver (a marker was already wiped just above).
+                    _reply_gate_outcome = "replied"
+                elif _decided_silent:
+                    # Explicit decision to stay silent — the clean, intended
+                    # path. Nothing to deliver; the decision is on record.
                     _reply_gate_suppress = True
-                    _reply_gate_fallback = False
-                elif getattr(self.config, "reply_gate_tool_fallback", True):
-                    # Fallback ratchet (Phase-1 safety): a substantive answer was
-                    # produced but no tool send happened — still deliver it
-                    # (today's behavior) so the feature can only remove duplicate/
-                    # leaked text, never silently swallow a real reply.
-                    _reply_gate_suppress = False
-                    _reply_gate_fallback = True
+                    _reply_gate_outcome = "silent"
                 else:
+                    # Neither call happened this turn: the model produced a
+                    # free-text tail (possibly substantive-looking) without
+                    # ever deciding. Default remains silence — but distinctly
+                    # flagged as a non-decision, not a chosen one.
                     _reply_gate_suppress = True
-                    _reply_gate_fallback = False
+                    _reply_gate_outcome = "undecided"
                 logger.info(
                     "reply_gate: tool-mode session=%s policy=%s chars=%d "
-                    "tool_sends=%d suppressed=%s fallback=%d",
+                    "tool_sends=%d decided_silent=%d outcome=%s",
                     session_entry.session_id,
                     getattr(_reply_policy, "value", _reply_policy),
                     len(response),
                     _tool_send_count,
-                    _reply_gate_suppress,
-                    int(_reply_gate_fallback),
+                    int(_decided_silent),
+                    _reply_gate_outcome,
                 )
                 if _reply_gate_suppress:
                     response = ""
@@ -19459,6 +19471,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # carries a stale count into a new turn.
             try:
                 source.reply_gate_tool_sends = 0
+                source.reply_gate_decided_silent = 0
             except Exception:
                 pass
             _message_source_token = set_current_message_source(source)

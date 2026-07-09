@@ -255,6 +255,33 @@ def note_current_message_delivered() -> None:
         pass
 
 
+def note_current_message_silent() -> None:
+    """Record that the current turn EXPLICITLY decided to stay silent.
+
+    Companion to :func:`note_current_message_delivered` — the two functions
+    together make "reply" and "silent" symmetric, first-class decisions
+    instead of "reply" being an action and "silent" being the mere absence
+    of one. Under ``reply_gate_mode="tool"`` a free-response group turn that
+    calls neither is a turn that never DECIDED anything; the post-turn
+    delivery block treats that non-decision differently from an explicit
+    silent call (see gateway/run.py's reply-gate telemetry). Same turn-scoped
+    counter mechanics as note_current_message_delivered: mutates the shared
+    source object (not a contextvar) so the write survives the executor
+    thread -> asyncio loop boundary. No-op outside a gateway turn.
+    """
+    src = _current_message_source.get()
+    if src is None:
+        return
+    try:
+        src.reply_gate_decided_silent = int(
+            getattr(src, "reply_gate_decided_silent", 0) or 0
+        ) + 1
+    except Exception:
+        # Source object may be an unexpected shape (defensive: never let a
+        # bookkeeping write break a successful decision).
+        pass
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

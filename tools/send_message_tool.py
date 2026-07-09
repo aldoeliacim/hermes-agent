@@ -209,8 +209,8 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "enum": ["send", "list", "react", "unreact", "silent"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction. 'silent' EXPLICITLY declares 'I decided not to reply to this turn' — required in tool-gated free-response groups so silence is a deliberate decision, not just the absence of a send call; has no delivery effect, only records the decision."
             },
             "target": {
                 "type": "string",
@@ -246,6 +246,9 @@ def send_message_tool(args, **kw):
 
     if action == "unreact":
         return _handle_react(args, remove=True)
+
+    if action == "silent":
+        return _handle_silent(args)
 
     return _handle_send(args)
 
@@ -349,6 +352,36 @@ def _handle_react(args, remove=False):
     if isinstance(result, dict):
         return json.dumps(result)
     return json.dumps({"success": bool(result)})
+
+
+def _handle_silent(args):
+    """Record an EXPLICIT decision not to reply to the current gateway turn.
+
+    Only meaningful for ``target="current"``/omitted target during a live
+    gateway turn — this is the tool-gated reply-gate's silence counterpart to
+    _handle_send. Calling it is how the model DECIDES to stay silent, as
+    opposed to simply not calling send_message at all (which the post-turn
+    delivery block treats as a non-decision requiring a nudge/retry rather
+    than an accepted silence — see gateway/run.py's reply-gate telemetry).
+    No platform I/O happens; this only flips a turn-scoped counter on the
+    shared SessionSource object.
+    """
+    target = (args.get("target") or "current").strip()
+    if target not in ("", "current"):
+        return tool_error(
+            "action='silent' only applies to the current chat "
+            "(target='current' or omitted) — it declares 'I chose not to "
+            "reply to THIS turn', not silence toward an arbitrary target."
+        )
+    from tools.approval import get_current_message_source, note_current_message_silent
+    if get_current_message_source() is None:
+        return tool_error(
+            "action='silent' is only valid during a live gateway turn "
+            "(the chat this message came from). No inbound message source "
+            "is registered in this context."
+        )
+    note_current_message_silent()
+    return json.dumps({"success": True, "decision": "silent"})
 
 
 def _handle_send(args):

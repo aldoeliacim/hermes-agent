@@ -213,10 +213,18 @@ class SessionSource:
     # decide whether the tool-gated delivery inversion applies.
     # `reply_gate_tool_sends` is a turn-scoped counter incremented when the
     # agent delivers to THIS chat via send_message(target="current"); the
-    # post-turn block reads it to dedup the free-text tail. Both are per-turn
+    # post-turn block reads it to dedup the free-text tail.
+    # `reply_gate_decided_silent` is the companion counter, incremented when
+    # the agent explicitly calls send_message(target="current",
+    # action="silent") to declare "I decided not to reply" rather than just
+    # producing no tool call. Together these two counters let the post-turn
+    # block distinguish three outcomes: replied (tool_sends>0), explicitly
+    # silent (decided_silent>0), or never decided (both zero) — only the
+    # third is treated as a failure requiring a nudge/retry. Both are per-turn
     # runtime state, never persisted or sent across the wire.
     reply_policy: ReplyPolicy = ReplyPolicy.DM
     reply_gate_tool_sends: int = 0
+    reply_gate_decided_silent: int = 0
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`

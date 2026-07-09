@@ -715,13 +715,16 @@ class GatewayConfig:
     # model calls send_message(target="current"). DMs and mention-gated groups
     # are unaffected in either mode. config.yaml-only; no HERMES_* env var.
     reply_gate_mode: str = "prompt"  # "prompt" | "tool"
-    # Fallback ratchet for "tool" mode: while True (default during burn-in), a
-    # tool-mode turn that made zero current-chat tool sends AND whose final text
-    # is a substantive (non-silence-marker) answer still delivers that text —
-    # today's behavior as a safety net so the feature can only remove duplicate/
-    # leaked text, never silently swallow a real answer. Flipping to False (a
-    # deliberate operator decision, out of scope for this change) makes
-    # silence-by-default real.
+    # DEPRECATED, no-op as of the explicit-decision redesign: the fallback
+    # ratchet that used to auto-deliver a substantive-looking free-text tail
+    # when the model made zero current-chat tool calls has been removed. The
+    # model must now EXPLICITLY call send_message(target="current", ...) to
+    # reply or send_message(target="current", action="silent") to decline —
+    # a turn that calls neither is logged as "undecided" (see gateway/run.py
+    # reply-gate telemetry) and is silent, same as before, but for a
+    # different reason (no decision was made, not "the ratchet rescued it").
+    # Field kept (rather than removed) so existing config.yaml files that
+    # set it don't fail to parse; the value is read but has no effect.
     reply_gate_tool_fallback: bool = True
 
     # STT settings

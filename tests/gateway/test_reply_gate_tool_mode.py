@@ -1,11 +1,19 @@
-"""Reply-gate tool-mode delivery inversion (Phase 1).
+"""Reply-gate tool-mode delivery inversion + explicit-decision redesign.
 
-Covers the tool-gated delivery mechanism, the fallback ratchet, the
-ReplyPolicy resolver, target="current" addressing, and the group-mode
-interruption note. The feature is config-flagged OFF by default
+Covers the tool-gated delivery mechanism, the ReplyPolicy resolver,
+target="current" addressing (both send and silent decisions), and the
+group-mode interruption note. The feature is config-flagged OFF by default
 (reply_gate_mode="prompt"); these tests assert that opting in flips delivery
 only for free-response GROUP turns and leaves DMs / mention-gated groups /
 prompt mode byte-identical.
+
+Explicit-decision redesign (post fallback-ratchet removal): a tool-gated
+turn must EXPLICITLY call send_message(target="current", ...) to reply or
+send_message(target="current", action="silent") to decline. There is no
+longer a fallback that auto-delivers a substantive-looking tail when neither
+call happened — that turn is silent either way, but logged as a distinct
+"undecided" outcome rather than merged into "replied" or "silent". See
+gateway/run.py's reply-gate telemetry (_reply_gate_outcome).
 """
 
 import json
@@ -23,7 +31,7 @@ from gateway.reply_policy import ReplyPolicy, resolve_reply_policy
 from gateway.run import _build_interruption_system_note
 from gateway.session import SessionEntry, SessionSource
 from tools import approval
-from tools.send_message_tool import _handle_send
+from tools.send_message_tool import _handle_send, _handle_silent
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +104,8 @@ def test_unstamped_event_defaults_to_dm():
 def test_config_defaults_and_coercion():
     c = GatewayConfig()
     assert c.reply_gate_mode == "prompt"
+    # reply_gate_tool_fallback is deprecated/no-op but still parses for
+    # backward compat with existing config.yaml files.
     assert c.reply_gate_tool_fallback is True
     # garbage → prompt (never raise on bad config)
     assert GatewayConfig.from_dict({"reply_gate_mode": "bogus"}).reply_gate_mode == "prompt"
@@ -109,7 +119,7 @@ def test_config_defaults_and_coercion():
 
 
 # --------------------------------------------------------------------------- #
-# target="current" resolution (T-GATE-6)
+# target="current" resolution — reply decision (T-GATE-6)
 # --------------------------------------------------------------------------- #
 
 
@@ -151,6 +161,52 @@ def test_target_current_resolves_registered_turn(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# target="current", action="silent" — explicit silence decision (new)
+# --------------------------------------------------------------------------- #
+
+
+def test_silent_action_errors_outside_gateway_turn():
+    r = json.loads(_handle_silent({}))
+    assert "error" in r
+    assert "live gateway turn" in r["error"]
+
+
+def test_silent_action_records_decision_without_platform_io(monkeypatch):
+    src = SessionSource(platform=Platform.WHATSAPP, chat_id="123@g.us", chat_type="group")
+
+    # No platform send path is patched in — if _handle_silent tried to do any
+    # platform I/O this test would blow up with an unmocked network call.
+    tok = approval.set_current_message_source(src)
+    try:
+        r = json.loads(_handle_silent({"target": "current"}))
+    finally:
+        approval.reset_current_message_source(tok)
+
+    assert r.get("success") is True
+    assert r.get("decision") == "silent"
+    assert src.reply_gate_decided_silent == 1
+    # Silence decision must never also count as a delivery.
+    assert src.reply_gate_tool_sends == 0
+
+
+def test_silent_action_omitted_target_defaults_to_current(monkeypatch):
+    src = SessionSource(platform=Platform.WHATSAPP, chat_id="123@g.us", chat_type="group")
+    tok = approval.set_current_message_source(src)
+    try:
+        r = json.loads(_handle_silent({}))
+    finally:
+        approval.reset_current_message_source(tok)
+    assert r.get("success") is True
+    assert src.reply_gate_decided_silent == 1
+
+
+def test_silent_action_rejects_non_current_target():
+    r = json.loads(_handle_silent({"target": "telegram:12345"}))
+    assert "error" in r
+    assert "current" in r["error"]
+
+
+# --------------------------------------------------------------------------- #
 # Interruption note group-mode variant (T-COLL-3 companion)
 # --------------------------------------------------------------------------- #
 
@@ -168,13 +224,13 @@ def test_interruption_note_group_vs_dm():
 
 
 # --------------------------------------------------------------------------- #
-# Post-turn delivery inversion (T-GATE / T-FALL) — E2E through the runner
+# Post-turn delivery inversion (T-GATE) — E2E through the runner
 # --------------------------------------------------------------------------- #
 
 _SESSION_KEY = "agent:main:whatsapp:group:123@g.us:u1"
 
 
-def _source(reply_policy=ReplyPolicy.FREE_RESPONSE, chat_type="group", tool_sends=0):
+def _source(reply_policy=ReplyPolicy.FREE_RESPONSE, chat_type="group", tool_sends=0, decided_silent=0):
     src = SessionSource(
         platform=Platform.WHATSAPP,
         chat_id="123@g.us",
@@ -183,6 +239,7 @@ def _source(reply_policy=ReplyPolicy.FREE_RESPONSE, chat_type="group", tool_send
     )
     src.reply_policy = reply_policy
     src.reply_gate_tool_sends = tool_sends
+    src.reply_gate_decided_silent = decided_silent
     return src
 
 
@@ -254,12 +311,13 @@ async def _run(runner, src, text):
 
 
 @pytest.mark.asyncio
-async def test_tool_gated_silence_is_non_event(monkeypatch, tmp_path, caplog):
+async def test_tool_gated_undecided_turn_is_silent(monkeypatch, tmp_path, caplog):
     # T-GATE-1: tool mode, free-response group, chatty tail, zero tool sends,
-    # ratchet OFF → nothing delivered; transcript still persisted; telemetry.
+    # zero silent decisions → nothing delivered (no fallback rescues it
+    # anymore); transcript still persisted; outcome logged as "undecided".
     runner = _runner(
         monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=False),
+        GatewayConfig(reply_gate_mode="tool"),
     )
     src = _source()
     with caplog.at_level(logging.INFO, logger="gateway.run"):
@@ -267,20 +325,66 @@ async def test_tool_gated_silence_is_non_event(monkeypatch, tmp_path, caplog):
     assert response == ""
     appended = [c.args[1] for c in runner.session_store.append_to_transcript.call_args_list]
     assert any(m.get("role") == "assistant" for m in appended)
-    assert any("reply_gate: tool-mode" in r.message and "tool_sends=0" in r.message
-               for r in caplog.records)
+    assert any(
+        "reply_gate: tool-mode" in r.message
+        and "tool_sends=0" in r.message
+        and "decided_silent=0" in r.message
+        and "outcome=undecided" in r.message
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
-async def test_tool_send_dedup_suppresses_tail(monkeypatch, tmp_path):
-    # T-GATE-2 / T-FALL-3: a current-target tool send happened this turn → the
-    # free-text tail is NOT also delivered (dedup), even with fallback ON.
+async def test_tool_gated_explicit_silent_decision_logged_distinctly(monkeypatch, tmp_path, caplog):
+    # New: the model called send_message(target="current", action="silent")
+    # this turn. Delivery outcome is identical to "undecided" (nothing sent)
+    # but the telemetry MUST distinguish the two — this is the entire point
+    # of the explicit-decision redesign.
     runner = _runner(
         monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=True),
+        GatewayConfig(reply_gate_mode="tool"),
+    )
+    src = _source(decided_silent=1)
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        response = await _run(runner, src, "some free text the model left behind")
+    assert response == ""
+    assert any(
+        "reply_gate: tool-mode" in r.message
+        and "decided_silent=1" in r.message
+        and "outcome=silent" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_send_dedup_suppresses_tail(monkeypatch, tmp_path, caplog):
+    # T-GATE-2: a current-target tool send happened this turn → the free-text
+    # tail is NOT also delivered (dedup), outcome logged as "replied".
+    runner = _runner(
+        monkeypatch, tmp_path,
+        GatewayConfig(reply_gate_mode="tool"),
     )
     src = _source(tool_sends=1)
-    response = await _run(runner, src, "and here is a chatty tail too")
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        response = await _run(runner, src, "and here is a chatty tail too")
+    assert response == ""
+    assert any(
+        "reply_gate: tool-mode" in r.message and "outcome=replied" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_send_wins_over_silent_decision_if_both_somehow_set(monkeypatch, tmp_path):
+    # Defense in depth: a tool-driven send always takes priority in the
+    # dedup logic, even in the (should-never-happen) case both counters are
+    # nonzero — a delivered message must never be reported as "silent".
+    runner = _runner(
+        monkeypatch, tmp_path,
+        GatewayConfig(reply_gate_mode="tool"),
+    )
+    src = _source(tool_sends=1, decided_silent=1)
+    response = await _run(runner, src, "chatty tail")
     assert response == ""
 
 
@@ -314,43 +418,19 @@ async def test_prompt_mode_branch_inert(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fallback_ratchet_delivers_substantive_tail(monkeypatch, tmp_path, caplog):
-    # T-FALL-1: ratchet ON, zero tool sends, substantive non-marker tail →
-    # delivered (old behavior), telemetry marks fallback=1.
+async def test_no_fallback_rescue_for_substantive_undecided_tail(monkeypatch, tmp_path):
+    # Explicit regression guard for the removed ratchet: a substantive,
+    # non-marker tail with zero tool sends and zero silent decisions is now
+    # ALWAYS suppressed — there is no config path that resurrects the old
+    # "deliver it anyway" behavior. reply_gate_tool_fallback is a documented
+    # no-op; setting it True must not change the outcome.
     runner = _runner(
         monkeypatch, tmp_path,
         GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=True),
     )
     src = _source()
-    text = "the real answer the model forgot to send via tool"
-    with caplog.at_level(logging.INFO, logger="gateway.run"):
-        response = await _run(runner, src, text)
-    assert response == text
-    assert any("reply_gate: tool-mode" in r.message and "fallback=1" in r.message
-               for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_fallback_ratchet_still_suppresses_marker(monkeypatch, tmp_path):
-    # T-FALL-2: ratchet ON, zero tool sends, tail IS a silence marker →
-    # suppressed (the ratchet only rescues substantive answers).
-    runner = _runner(
-        monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=True),
-    )
-    src = _source()
-    assert await _run(runner, src, "NO_REPLY") == ""
-
-
-@pytest.mark.asyncio
-async def test_fallback_off_suppresses_substantive_tail(monkeypatch, tmp_path):
-    # T-FALL-4: ratchet OFF → the same substantive tail delivers nothing.
-    runner = _runner(
-        monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=False),
-    )
-    src = _source()
-    assert await _run(runner, src, "the real answer") == ""
+    text = "the real answer the model forgot to explicitly decide on"
+    assert await _run(runner, src, text) == ""
 
 
 @pytest.mark.asyncio
@@ -359,7 +439,7 @@ async def test_tool_gated_empty_tail_not_normalized(monkeypatch, tmp_path):
     # into a "no response" placeholder by the empty-response normalizer.
     runner = _runner(
         monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=True),
+        GatewayConfig(reply_gate_mode="tool"),
     )
     src = _source()
     response = await _run(runner, src, "")
