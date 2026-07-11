@@ -12444,18 +12444,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Three-way DECISION outcome (not a binary deliver/suppress):
             # the model must EXPLICITLY choose reply (send_message(target=
             # "current", ...)) or silent (send_message(target="current",
-            # action="silent")). There is no longer a fallback that
-            # auto-delivers a substantive-looking tail when neither call
-            # happened — that ratchet (reply_gate_tool_fallback) treated an
+            # action="silent")). There is no fallback ratchet that treats an
             # accident (the model just producing free text) the same as a
-            # deliberate decision, which is exactly backwards: it let the
+            # deliberate decision — that was exactly backwards, letting the
             # model skip deciding and still get delivery, so the emoji/
             # reaction over-reply class (see whatsapp-group-participation
-            # skill) never actually got the structural pressure to be more
-            # selective. Silence is still the outcome when nothing was
-            # decided, but it is logged as a DISTINCT "undecided" outcome —
-            # never merged into "silent" — so a model that never learns to
-            # call the tool is visible in telemetry, not invisibly "working."
+            # skill) never got structural pressure to be more selective.
+            #
+            # BUT dropping a genuinely substantive answer twice is worse than
+            # dropping it once. Before this branch runs, agent/conversation_loop.py
+            # already gave the model a bounded number of forced-decision
+            # nudges (agent/reply_decision_stop.py) specifically to get an
+            # explicit call. If a turn STILL reaches here undecided with a
+            # non-empty tail, the nudge has already failed — CONFIRMED real
+            # casualty 2026-07-11 (group "Quetzalogic - Hal"): a correct,
+            # complete 1260-char answer silently discarded here, the user
+            # found out two days later. Fail loudly instead: deliver the
+            # content anyway as a last-resort safety net (outcome=
+            # "undecided_delivered", logged at WARNING so it's never invisible
+            # in gateway.log) rather than compounding a discipline failure
+            # into user-visible data loss. A genuinely empty/whitespace tail
+            # (banter the model correctly chose not to flesh out) has nothing
+            # to lose by suppressing, so it keeps the quiet "undecided"
+            # outcome at INFO.
             if tool_gated or _delivered_via_tool:
                 _decided_silent = int(
                     getattr(source, "reply_gate_decided_silent", 0) or 0
@@ -12471,21 +12482,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # path. Nothing to deliver; the decision is on record.
                     _reply_gate_suppress = True
                     _reply_gate_outcome = "silent"
+                elif response.strip():
+                    # Neither call happened this turn despite the forced-
+                    # decision nudge loop (agent/reply_decision_stop.py)
+                    # already spending its bounded attempts trying to get an
+                    # explicit call — by the time a turn reaches this branch
+                    # still undecided, the nudge has already failed to fix
+                    # it. CONFIRMED real casualty 2026-07-11 (group
+                    # "Quetzalogic - Hal"): a correct, complete 1260-char
+                    # answer was silently discarded here under the old
+                    # suppress-always contract, and the user only found out
+                    # two days later. Silently dropping a real answer a
+                    # SECOND time (even after nudging) is a worse failure
+                    # mode than an occasional duplicate/over-eager delivery
+                    # — fail loudly instead: deliver it anyway as the last-
+                    # resort safety net, and log at WARNING (not INFO) so
+                    # this path is never invisible in gateway.log. Emptied
+                    # responses (banter the model correctly decided not to
+                    # flesh out) still fall through to the suppress-with-
+                    # nothing-lost branch below — there's nothing to fail
+                    # loudly about when there's no content.
+                    _reply_gate_suppress = False
+                    _reply_gate_outcome = "undecided_delivered"
                 else:
-                    # Neither call happened this turn: the model produced a
-                    # free-text tail (possibly substantive-looking) without
-                    # ever deciding. Default remains silence — but distinctly
-                    # flagged as a non-decision, not a chosen one.
+                    # Genuinely nothing to deliver (empty/whitespace-only
+                    # tail) — suppression here loses nothing, so this stays
+                    # the quiet "undecided" outcome, not the loud fallback.
                     _reply_gate_suppress = True
                     _reply_gate_outcome = "undecided"
-                logger.info(
+                _reply_gate_log = (
+                    logger.warning
+                    if _reply_gate_outcome == "undecided_delivered"
+                    else logger.info
+                )
+                _reply_gate_log(
                     "reply_gate: tool-mode session=%s policy=%s chars=%d "
-                    "tool_sends=%d decided_silent=%d outcome=%s",
+                    "tool_sends=%d decided_silent=%d nudges=%d outcome=%s",
                     session_entry.session_id,
                     getattr(_reply_policy, "value", _reply_policy),
                     len(response),
                     _tool_send_count,
                     int(_decided_silent),
+                    int(agent_result.get("reply_decision_nudges", 0) or 0),
                     _reply_gate_outcome,
                 )
                 if _reply_gate_suppress:

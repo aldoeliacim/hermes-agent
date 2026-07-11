@@ -464,6 +464,11 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        # Surfaced so the gateway's post-turn reply-gate log line can report
+        # how many forced-decision nudges (agent/reply_decision_stop.py)
+        # fired before the turn ended — telemetry for tuning the nudge cap,
+        # and evidence when the last-resort delivery fallback activates.
+        "reply_decision_nudges": getattr(agent, "_reply_decision_nudges", 0),
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

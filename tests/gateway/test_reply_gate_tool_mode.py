@@ -311,25 +311,56 @@ async def _run(runner, src, text):
 
 
 @pytest.mark.asyncio
-async def test_tool_gated_undecided_turn_is_silent(monkeypatch, tmp_path, caplog):
-    # T-GATE-1: tool mode, free-response group, chatty tail, zero tool sends,
-    # zero silent decisions → nothing delivered (no fallback rescues it
-    # anymore); transcript still persisted; outcome logged as "undecided".
+async def test_tool_gated_undecided_turn_with_content_delivers_loudly(monkeypatch, tmp_path, caplog):
+    # T-GATE-1 (updated post fail-loudly redesign): tool mode, free-response
+    # group, a SUBSTANTIVE chatty tail, zero tool sends, zero silent
+    # decisions. The forced-decision nudge loop (agent/reply_decision_stop.py)
+    # already had its bounded attempts to get an explicit call before the
+    # turn could reach this branch — so by the time delivery is deciding what
+    # to do with a real, non-empty tail that's STILL undecided, silently
+    # dropping it a second time is strictly worse than delivering it. Last-
+    # resort fail-loud: deliver anyway, log at WARNING, outcome=
+    # undecided_delivered (a DISTINCT outcome from the old always-suppress
+    # "undecided", which is now reserved for genuinely empty/whitespace-only
+    # tails with nothing to lose by suppressing).
     runner = _runner(
         monkeypatch, tmp_path,
         GatewayConfig(reply_gate_mode="tool"),
     )
     src = _source()
     with caplog.at_level(logging.INFO, logger="gateway.run"):
-        response = await _run(runner, src, "just some banter, nothing to do here")
-    assert response == ""
-    appended = [c.args[1] for c in runner.session_store.append_to_transcript.call_args_list]
-    assert any(m.get("role") == "assistant" for m in appended)
+        response = await _run(runner, src, "here is a real substantive answer the model forgot to send")
+    assert response == "here is a real substantive answer the model forgot to send"
     assert any(
-        "reply_gate: tool-mode" in r.message
+        r.levelno == logging.WARNING
+        and "reply_gate: tool-mode" in r.message
+        and "tool_sends=0" in r.message
+        and "decided_silent=0" in r.message
+        and "outcome=undecided_delivered" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_gated_undecided_turn_empty_tail_stays_silent(monkeypatch, tmp_path, caplog):
+    # Companion to the above: an undecided turn with a genuinely empty/
+    # whitespace-only tail has nothing to lose by suppressing — this keeps
+    # the quiet "undecided" outcome at INFO, not the loud fallback.
+    runner = _runner(
+        monkeypatch, tmp_path,
+        GatewayConfig(reply_gate_mode="tool"),
+    )
+    src = _source()
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        response = await _run(runner, src, "   ")
+    assert response == ""
+    assert any(
+        r.levelno == logging.INFO
+        and "reply_gate: tool-mode" in r.message
         and "tool_sends=0" in r.message
         and "decided_silent=0" in r.message
         and "outcome=undecided" in r.message
+        and "undecided_delivered" not in r.message
         for r in caplog.records
     )
 
@@ -418,19 +449,21 @@ async def test_prompt_mode_branch_inert(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_fallback_rescue_for_substantive_undecided_tail(monkeypatch, tmp_path):
-    # Explicit regression guard for the removed ratchet: a substantive,
-    # non-marker tail with zero tool sends and zero silent decisions is now
-    # ALWAYS suppressed — there is no config path that resurrects the old
-    # "deliver it anyway" behavior. reply_gate_tool_fallback is a documented
-    # no-op; setting it True must not change the outcome.
-    runner = _runner(
-        monkeypatch, tmp_path,
-        GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=True),
-    )
-    src = _source()
+async def test_reply_gate_tool_fallback_flag_remains_a_documented_noop(monkeypatch, tmp_path):
+    # reply_gate_tool_fallback (the OLD auto-deliver-if-substantive ratchet)
+    # stays a documented no-op — the fail-loud "undecided_delivered" path
+    # added post-2026-07-11 is unconditional (not gated by this deprecated
+    # flag) and produces the identical delivered outcome whether the flag is
+    # True or False, confirming the deprecated config knob has zero effect
+    # in either direction.
     text = "the real answer the model forgot to explicitly decide on"
-    assert await _run(runner, src, text) == ""
+    for flag in (True, False):
+        runner = _runner(
+            monkeypatch, tmp_path,
+            GatewayConfig(reply_gate_mode="tool", reply_gate_tool_fallback=flag),
+        )
+        src = _source()
+        assert await _run(runner, src, text) == text
 
 
 @pytest.mark.asyncio
