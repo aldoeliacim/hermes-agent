@@ -2024,16 +2024,59 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
-# ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
+# ``send_message`` was deliberately de-registered as an agent-callable model
+# tool by upstream c6c8abbad (2026-06-17, #47856): "The agent should not
+# decide on its own to fire off cross-platform messages or reactions."
+# That rationale holds for PROMPT-mode delivery (today's default and every
+# deployment that has not opted into reply_gate_mode="tool") — the model has
+# no reason to reach for this tool because free-text delivery already works.
+#
+# But gateway/run.py's tool-gated reply-gate redesign (46d1b2a16, 3d20fec55,
+# and the forced-decision nudge in agent/reply_decision_stop.py) inverted
+# that contract for free-response GROUP turns specifically: under
+# reply_gate_mode="tool" the model's free text is NOT auto-delivered, and
+# send_message(target="current", ...) is the ONLY sanctioned way to actually
+# reply or explicitly decide silence. That mechanism was built and shipped
+# across three commits (2026-07-06 through 2026-07-11) on the false premise
+# that this tool was already agent-callable — it was not, because the
+# registry.register() call below was never restored after the upstream
+# removal. The model, correctly finding no send_message tool in its schema,
+# fell back to a workaround from the sending-platform-messages skill
+# (`hermes send` CLI via terminal) — which bypasses reply-gate bookkeeping
+# entirely, so the fail-loud "undecided_delivered" fallback ALSO fired,
+# producing a genuine double-send + narrated-status leak into a real family
+# WhatsApp group (CONFIRMED 2026-07-11, "TAMHAL Y JVic").
+#
+# Fix: register it, but gate registration on ``reply_gate_mode == "tool"``
+# via check_fn so upstream's design intent is fully preserved for every
+# deployment that has NOT opted into tool-gated delivery — the tool adds
+# zero schema cost and the model has zero ability to "decide on its own to
+# fire off cross-platform messages" outside this one opted-in mechanism.
+# Byte-identical to before this fix for prompt-mode (the default).
+def _check_send_message_tool_gated() -> bool:
+    try:
+        from gateway.config import load_gateway_config
+        cfg = load_gateway_config()
+        return str(getattr(cfg, "reply_gate_mode", "prompt")).strip().lower() == "tool"
+    except Exception:
+        return False
+
+
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message_tool_gated,
+    emoji="📤",
+)
+
+# The send engine in this module (``_send_to_platform``, ``_send_via_adapter``,
+# ``_parse_target_ref``, the per-platform ``_send_*`` helpers) remains the
+# shared transport used directly (bypassing the registry entirely) by:
 #   - cron delivery (cron/scheduler.py)
 #   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
 #   - the gateway kanban notifier (dashboard-toggled, outside agent control)
 #   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.

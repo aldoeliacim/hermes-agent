@@ -69,6 +69,23 @@ _HERMES_CORE_TOOLS = [
     # bridge being configured via check_fn; survives the upstream send_message
     # removal because it is a distinct, service-gated tool.
     "whatsapp_action",
+    # Tool-gated reply delivery (reply_gate_mode="tool", gateway/run.py's
+    # reply-gate redesign): the ONLY sanctioned way a free-response GROUP
+    # turn can actually reply or explicitly decide silence once tool_gated
+    # applies. Gated via check_fn (tools/send_message_tool.py:
+    # _check_send_message_tool_gated) on reply_gate_mode=="tool" — zero
+    # schema cost and zero agent capability to "decide on its own to fire
+    # off cross-platform messages" for the default prompt-mode deployment
+    # upstream's c6c8abbad removal was protecting (#47856). Restores the
+    # tool that gateway/run.py, gateway/reply_policy.py, and
+    # agent/reply_decision_stop.py have depended on since 2026-07-06 — it
+    # was never re-registered after the upstream removal, so every
+    # tool-gated turn silently had no send_message tool to call at all.
+    # CONFIRMED real casualty 2026-07-11 ("TAMHAL Y JVic" group): the model,
+    # correctly finding no such tool, fell back to a `hermes send` CLI
+    # workaround that bypassed reply-gate bookkeeping and produced a
+    # narrated-status double-send leak.
+    "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is

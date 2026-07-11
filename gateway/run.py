@@ -13465,7 +13465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         deployment opts in. Consumed by both the post-turn delivery block and the
         streaming-eligibility gate (streamed text IS delivery).
         """
-        if getattr(self.config, "reply_gate_mode", "prompt") != "tool":
+        if getattr(getattr(self, "config", None), "reply_gate_mode", "prompt") != "tool":
             return False
         from gateway.reply_policy import ReplyPolicy
         return getattr(source, "reply_policy", None) == ReplyPolicy.FREE_RESPONSE
