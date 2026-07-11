@@ -242,15 +242,56 @@ def send_message_tool(args, **kw):
         return _handle_list()
 
     if action == "react":
-        return _handle_react(args)
+        return _guarded_live_turn_call(_handle_react, args)
 
     if action == "unreact":
-        return _handle_react(args, remove=True)
+        return _guarded_live_turn_call(_handle_react, args, remove=True)
 
     if action == "silent":
         return _handle_silent(args)
 
     return _handle_send(args)
+
+
+# Live-turn scope guard.
+#
+# check_fn (_check_send_message_tool_gated, below) controls whether this tool
+# is EXPOSED IN THE SCHEMA at all -- but it is a deployment-wide switch
+# (reply_gate_mode == "tool"), not a per-turn one. On any deployment with
+# that mode configured, the tool is visible in EVERY turn -- DMs, mention-
+# gated groups, everywhere -- not just the narrow tool-gated free-response
+# case gateway/reply_policy.py actually built it for. Confirmed live
+# 2026-07-11: with only the schema-exposure gate in place, a model mid-turn
+# could call send_message(target="telegram:<arbitrary_chat_id>", ...) or
+# send_message(action="react", target="<any platform>:<any chat>", ...)
+# from ANY live turn, not just a tool-gated one -- exactly the autonomous
+# cross-platform capability upstream's c6c8abbad (#47856) removed the tool
+# to prevent: "The agent should not decide on its own to fire off
+# cross-platform messages or reactions."
+#
+# This guard restores that boundary precisely: whenever the tool is invoked
+# from INSIDE a live gateway turn (tools.approval.get_current_message_source()
+# is set -- true only while the gateway is running an actual agent turn,
+# never for CLI/cron/subagent/MCP-server callers), _handle_react/_handle_react
+# with remove=True are refused outright. There is no "current chat" concept
+# for react/unreact in this tool, and a dedicated, already-scoped alternative
+# exists (whatsapp_action(action="react_message"), toolsets.py's
+# whatsapp_action entry) for the one legitimate live-turn reaction need.
+# _handle_send's OWN body (not this wrapper) separately enforces the
+# matching restriction for the send action: target must be "current"/omitted
+# whenever a live turn is active -- see the check inside _handle_send.
+def _guarded_live_turn_call(handler, args, **handler_kwargs):
+    from tools.approval import get_current_message_source
+    if get_current_message_source() is not None:
+        return tool_error(
+            "action='react'/'unreact' is not available inside a live "
+            "gateway turn -- reacting to an arbitrary cross-platform "
+            "target is exactly the autonomous capability upstream "
+            "removed this tool to prevent (#47856). To react to a "
+            "message in the CURRENT WhatsApp chat, use "
+            "whatsapp_action(action='react_message') instead."
+        )
+    return handler(args, **handler_kwargs)
 
 
 def _handle_list():
@@ -419,6 +460,28 @@ def _handle_send(args):
                 "(missing platform/chat id on the message source)."
             )
     else:
+        # An explicit non-"current" target inside a live gateway turn is
+        # exactly the autonomous cross-platform capability upstream's
+        # c6c8abbad (#47856) removed this tool to prevent. Registering the
+        # tool again (2026-07-11, for the tool-gated reply-gate mechanism)
+        # was scoped by check_fn to reply_gate_mode=="tool" -- but that is a
+        # deployment-wide switch, not a per-turn one, so on a deployment
+        # with that mode configured the tool is schema-visible in EVERY
+        # turn, and without this check the model could message an arbitrary
+        # target from a DM or a mention-gated group, not just decide the
+        # current chat's reply. Refuse outright rather than silently
+        # succeed; non-agent callers (hermes send CLI, cron, mcp_serve.py)
+        # never run inside a live turn context, so this never affects them.
+        from tools.approval import get_current_message_source
+        if get_current_message_source() is not None:
+            return tool_error(
+                "An explicit cross-platform target is not available inside "
+                "a live gateway turn -- only target='current' (reply to "
+                "the chat this turn came from) or action='silent' are "
+                "permitted. Sending to an arbitrary target is handled "
+                "outside the agent loop (cron delivery, `hermes send` "
+                "CLI) by design (#47856)."
+            )
         parts = target.split(":", 1)
         platform_name = parts[0].strip().lower()
         target_ref = parts[1].strip() if len(parts) > 1 else None
