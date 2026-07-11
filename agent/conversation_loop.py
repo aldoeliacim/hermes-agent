@@ -5276,6 +5276,70 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # Reply-decision gate: when this turn is running under the
+                # tool-gated reply gate (reply_gate_mode="tool" free-response
+                # group/DM — the gateway sets HERMES_REPLY_GATE_TOOL_GATED=1
+                # for the duration of the turn; see gateway/run.py's
+                # _run_agent_inner), a text_response exit with neither a
+                # current-chat send_message call NOR an explicit
+                # action="silent" call means the model never DECIDED anything
+                # — the free text above is about to be silently discarded by
+                # the gateway's post-turn "undecided" suppression. Force one
+                # more round with an explicit nudge before accepting that
+                # outcome, mirroring the verify-on-stop pattern above.
+                # CONFIRMED real casualty 2026-07-11 (see
+                # agent/reply_decision_stop.py's module docstring): a correct,
+                # complete, 1260-char answer was silently dropped because the
+                # model wrote it and never called send_message.
+                _reply_nudge = None
+                if os.environ.get("HERMES_REPLY_GATE_TOOL_GATED") == "1":
+                    try:
+                        from agent.reply_decision_stop import (
+                            build_reply_decision_nudge,
+                            reply_decision_nudge_enabled,
+                        )
+                        from tools.approval import get_current_message_source
+
+                        if reply_decision_nudge_enabled():
+                            _src = get_current_message_source()
+                            _reply_nudge = build_reply_decision_nudge(
+                                tool_sends=int(
+                                    getattr(_src, "reply_gate_tool_sends", 0) or 0
+                                ),
+                                decided_silent=int(
+                                    getattr(_src, "reply_gate_decided_silent", 0) or 0
+                                ),
+                                attempts=getattr(agent, "_reply_decision_nudges", 0),
+                            )
+                    except Exception:
+                        logger.debug("reply-decision nudge check failed", exc_info=True)
+                        _reply_nudge = None
+
+                if _reply_nudge:
+                    agent._reply_decision_nudges = (
+                        getattr(agent, "_reply_decision_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "reply_decision_required"
+                    final_msg["_reply_decision_synthetic"] = True
+                    messages.append(final_msg)
+                    # Same synthetic-scaffolding contract as the verify-on-stop
+                    # nudge: keep the attempted answer in model history for
+                    # role alternation, flag both turns synthetic so neither
+                    # persists into the durable transcript, and don't surface
+                    # the un-delivered attempt to the user as if it were sent.
+                    messages.append({
+                        "role": "user",
+                        "content": _reply_nudge,
+                        "_reply_decision_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "reply-decision nudge issued (attempt %d) — model "
+                        "produced text without calling send_message",
+                        agent._reply_decision_nudges,
+                    )
+                    continue
+
                 # User verification-loop gate: when the agent edited code this
                 # turn, let a registered `pre_verify` hook (plugin/shell) keep it
                 # going one more turn. The shipped guidance is folded into the

@@ -19475,6 +19475,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             _message_source_token = set_current_message_source(source)
+            # Signal the tool-gated reply-decision guard (in-process, via env
+            # var — the conversation loop runs in this same process/thread
+            # tree, propagated to tool-executor worker threads alongside the
+            # other approval contextvars) so agent/reply_decision_stop.py only
+            # activates for turns where the gateway will actually suppress an
+            # undecided free-text tail. Byte-identical no-op for DMs,
+            # mention-gated groups, and prompt mode, matching _is_reply_tool_gated's
+            # existing default-OFF contract. Reset in the finally below so a
+            # reused worker thread never carries a stale flag into the next
+            # (possibly non-tool-gated) turn.
+            _reply_gate_tool_gated_env_prev = os.environ.get("HERMES_REPLY_GATE_TOOL_GATED")
+            if self._is_reply_tool_gated(source):
+                os.environ["HERMES_REPLY_GATE_TOOL_GATED"] = "1"
+            elif _reply_gate_tool_gated_env_prev is not None:
+                os.environ.pop("HERMES_REPLY_GATE_TOOL_GATED", None)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -19576,6 +19591,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
                 reset_current_session_key(_approval_session_token)
                 reset_current_message_source(_message_source_token)
+                # Restore the pre-turn HERMES_REPLY_GATE_TOOL_GATED state so a
+                # worker thread reused for the NEXT turn (possibly non-tool-
+                # gated) never inherits this turn's flag.
+                if _reply_gate_tool_gated_env_prev is not None:
+                    os.environ["HERMES_REPLY_GATE_TOOL_GATED"] = _reply_gate_tool_gated_env_prev
+                else:
+                    os.environ.pop("HERMES_REPLY_GATE_TOOL_GATED", None)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

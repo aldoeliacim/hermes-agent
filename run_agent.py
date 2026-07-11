@@ -234,6 +234,12 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # Same contract for the reply-decision gate's forced-decision nudge
+    # (agent/reply_decision_stop.py) — a synthetic assistant "done" plus a
+    # synthetic user nudge that push a tool-gated turn to actually call
+    # send_message instead of ending undecided. Ephemeral for the identical
+    # reason: it exists only to drive that turn's remaining rounds.
+    "_reply_decision_synthetic",
 )
 
 
