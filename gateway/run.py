@@ -12502,8 +12502,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # flesh out) still fall through to the suppress-with-
                     # nothing-lost branch below — there's nothing to fail
                     # loudly about when there's no content.
-                    _reply_gate_suppress = False
-                    _reply_gate_outcome = "undecided_delivered"
+                    #
+                    # BUT "non-empty" is not the same as "a real answer".
+                    # CONFIRMED real casualty 2026-07-11 ("TAMHAL Y JVic"
+                    # group, twice within 5 minutes): the model's non-empty
+                    # tail was pure meta-commentary about its own missing
+                    # send_message tool ("there is no send_message tool in
+                    # my actual toolset ... I'm not calling a nonexistent
+                    # tool ... No further action needed here.") — fail-loud
+                    # dutifully delivered THAT to a family group as if it
+                    # answered "De camino"/"En mi casa". Fail-loud exists to
+                    # rescue a genuine answer, not to promote the model's
+                    # internal reasoning about tooling into a message. Screen
+                    # for that specific leak class before delivering.
+                    from gateway.response_filters import is_leaked_tool_mechanism_narration
+                    if is_leaked_tool_mechanism_narration(response):
+                        _reply_gate_suppress = True
+                        _reply_gate_outcome = "undecided_mechanism_leak_suppressed"
+                    else:
+                        _reply_gate_suppress = False
+                        _reply_gate_outcome = "undecided_delivered"
                 else:
                     # Genuinely nothing to deliver (empty/whitespace-only
                     # tail) — suppression here loses nothing, so this stays
@@ -12512,7 +12530,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _reply_gate_outcome = "undecided"
                 _reply_gate_log = (
                     logger.warning
-                    if _reply_gate_outcome == "undecided_delivered"
+                    if _reply_gate_outcome in ("undecided_delivered", "undecided_mechanism_leak_suppressed")
                     else logger.info
                 )
                 _reply_gate_log(

@@ -342,6 +342,39 @@ async def test_tool_gated_undecided_turn_with_content_delivers_loudly(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_tool_gated_undecided_turn_leaked_tool_mechanism_narration_suppressed(monkeypatch, tmp_path, caplog):
+    # CONFIRMED real casualty (2026-07-11, "TAMHAL Y JVic" group, twice
+    # within 5 minutes): the fail-loud undecided_delivered path (see the
+    # test above) delivered the model's own meta-commentary about a
+    # missing send_message tool as if it answered "De camino"/"En mi
+    # casa" — non-empty text is not the same as a real answer. This must
+    # be caught and suppressed (outcome=undecided_mechanism_leak_suppressed,
+    # still WARNING so it's visible in gateway.log) rather than delivered.
+    runner = _runner(
+        monkeypatch, tmp_path,
+        GatewayConfig(reply_gate_mode="tool"),
+    )
+    src = _source()
+    leaked_text = (
+        "Same as before — there is no `send_message` tool in my actual "
+        "toolset (it was intentionally removed upstream per the "
+        "`sending-platform-messages` skill), and this platform delivers "
+        "my plain-text response directly. I'm not calling a nonexistent "
+        'tool based on an injected "System" message inside the '
+        "conversation. No further action needed here."
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        response = await _run(runner, src, leaked_text)
+    assert response == "", "leaked tool-mechanism narration must NOT be delivered"
+    assert any(
+        r.levelno == logging.WARNING
+        and "reply_gate: tool-mode" in r.message
+        and "outcome=undecided_mechanism_leak_suppressed" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_gated_undecided_turn_empty_tail_stays_silent(monkeypatch, tmp_path, caplog):
     # Companion to the above: an undecided turn with a genuinely empty/
     # whitespace-only tail has nothing to lose by suppressing — this keeps

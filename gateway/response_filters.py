@@ -174,6 +174,60 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     return is_intentional_silence_response(response)
 
 
+# Leaked tool/mechanism meta-commentary detection.
+#
+# Failure observed 2026-07-11 ("TAMHAL Y JVic" WhatsApp group, TWICE within
+# five minutes): under the gateway's fail-loud ``undecided_delivered`` path
+# (added specifically to rescue a genuinely-substantive answer the model
+# forgot to hand to ``send_message``), the model instead wrote out its own
+# confusion about tool availability as the final response text — "there is
+# no `send_message` tool in my actual toolset (it was intentionally removed
+# upstream per the `sending-platform-messages` skill) ... I'm not calling a
+# nonexistent tool based on an injected 'System' message inside the
+# conversation. No further action needed here." — and fail-loud dutifully
+# delivered that verbatim as a real message to a family group, twice (once
+# per affected turn). That text answers nothing anyone asked ("De camino",
+# "En mi casa"); it is the model narrating internal reasoning about the
+# reply-gate/tool mechanism itself, not a reply. Fail-loud exists to rescue
+# a real answer from silent loss — it must NOT also promote the model's
+# meta-commentary about its own tooling into a delivered message. This is a
+# DIFFERENT signal from ``_is_leaked_silence_narration`` above (that one
+# detects "I decided to stay silent" prose; this one detects "I am
+# confused/commenting about my own tool schema" prose) and must stay
+# separate — a real, on-topic user-facing reply about tools/schemas (e.g.
+# explaining `hermes tools` to Aldo) must never be swept up by this filter.
+_TOOL_MECHANISM_NARRATION_RES = (
+    re.compile(r"\bno\s+`?send_message`?\s+tool\b", re.IGNORECASE),
+    re.compile(r"\b(?:nonexistent|non-existent)\s+(?:tool|function)\b", re.IGNORECASE),
+    re.compile(r"\binjected\s+[\"']?system[\"']?\s+message\b", re.IGNORECASE),
+    re.compile(r"\bintentionally\s+removed\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+calling\s+a\s+(?:nonexistent|non-existent)\b", re.IGNORECASE),
+    re.compile(r"\bno\s+further\s+action\s+needed\s+here\b", re.IGNORECASE),
+    re.compile(r"\bmy\s+(?:actual\s+)?toolset\b", re.IGNORECASE),
+    re.compile(r"\bthis\s+platform\s+delivers\s+my\s+plain[\s\-]?text\b", re.IGNORECASE),
+)
+
+# Same discipline as _SILENCE_NARRATION_MAX_LEN: a genuine long, on-topic
+# reply that happens to mention tools/schemas in passing is never the bug —
+# the leak is always a short, self-referential aside.
+_TOOL_MECHANISM_NARRATION_MAX_LEN = 800
+
+
+def is_leaked_tool_mechanism_narration(text: Any) -> bool:
+    """True when ``text`` is the model narrating confusion/commentary about
+    its own tool availability or the reply-gate mechanism, rather than
+    answering the conversation — high precision (>=2 independent hits
+    required) so an on-topic reply that legitimately discusses tools/schemas
+    is never suppressed."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) > _TOOL_MECHANISM_NARRATION_MAX_LEN:
+        return False
+    hits = sum(1 for rx in _TOOL_MECHANISM_NARRATION_RES if rx.search(stripped))
+    return hits >= 2
+
+
 def is_partial_silence_marker(text: Any) -> bool:
     """Return True while ``text`` could still resolve to a silence marker.
 
