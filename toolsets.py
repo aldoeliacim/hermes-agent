@@ -207,6 +207,50 @@ TOOLSETS = {
         "tools": ["cronjob"],
         "includes": []
     },
+
+    # Standalone (non-composite) toolset entries for the two _HERMES_CORE_TOOLS
+    # members that are check_fn-gated model tools, not user-facing CLI toggles:
+    # "messaging" (send_message) and "whatsapp_action". Both are members of
+    # _HERMES_CORE_TOOLS so every hermes-<platform> composite includes them —
+    # but hermes_cli/tools_config.py::_get_platform_tools()'s "recover
+    # non-configurable toolsets" loop, which repairs a platform's tool schema
+    # when its config.yaml has an EXPLICIT platform_toolsets list (rather than
+    # the bare composite name), can only recover a toolset that (a) has a
+    # standalone entry here (no "includes", key not prefixed "hermes-") and
+    # (b) is not itself in CONFIGURABLE_TOOLSETS. Without that standalone
+    # entry, a check_fn-gated core tool is invisible on every platform whose
+    # config.yaml ever saved an explicit toolset list — silently, with no
+    # error, indistinguishable from the tool simply not existing.
+    #
+    # CONFIRMED REAL CASUALTY (2026-07-12, "Quetzalogic - Hal" WhatsApp
+    # group): this exact gap. Upstream c6c8abbad (2026-06-17, #47856)
+    # deleted BOTH the "messaging" standalone entry AND send_message's
+    # _HERMES_CORE_TOOLS membership. The 2026-07-11 fix (dc4c07ec2)
+    # restored the _HERMES_CORE_TOOLS membership and verified it worked —
+    # but only by resolving the bare "hermes-whatsapp" composite name
+    # directly, which is NOT the code path a real deployment with a saved
+    # platform_toolsets.whatsapp list actually uses. On this deployment
+    # (platform_toolsets.whatsapp explicitly set since well before this
+    # fix), send_message silently never reached the schema even after the
+    # "fix" — the model correctly reported "Tool 'send_message' does not
+    # exist" for a second time, a week after the first incident, because
+    # the verification method (bypassing _get_platform_tools) didn't match
+    # production reality. whatsapp_action had the SAME latent gap the whole
+    # time (independently confirmed missing from the live schema the same
+    # day) despite a skill claiming it works — it happened not to be
+    # user-visible yet because no live turn had needed to react on WhatsApp
+    # recently enough to surface the "does not exist" error.
+    "messaging": {
+        "description": "Cross-platform messaging: send_message, gated by check_fn on reply_gate_mode==\"tool\" (inert outside that mode).",
+        "tools": ["send_message"],
+        "includes": []
+    },
+
+    "whatsapp_action_recovery": {
+        "description": "WhatsApp bridge actions (react/status/etc), gated by check_fn on the WhatsApp bridge being configured. Standalone entry exists solely so _get_platform_tools()'s non-configurable-toolset recovery loop can restore it onto a platform with an explicit saved toolset list — not user-facing in `hermes tools`.",
+        "tools": ["whatsapp_action"],
+        "includes": []
+    },
     
 
     "file": {
