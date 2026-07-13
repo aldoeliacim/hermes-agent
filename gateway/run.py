@@ -11939,7 +11939,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # mutated during the turn. Drives dedup regardless of tool_gated.
             _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
             _delivered_via_tool = _tool_send_count > 0
-
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
             # produce visible content after exhausting all retries (nudge,
@@ -11952,6 +11951,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            # Defense-in-depth dedup signal (2026-07-12 "TAMHAL Y JVic" leak):
+            # the turn-scoped counter `reply_gate_tool_sends` is the primary
+            # signal that a send_message(target="current") delivered this turn,
+            # but a CONFIRMED production leak showed the counter reading 0 even
+            # though the transcript proves a send_message with a success result
+            # fired (msg 199272-199274: send_message(target='current') ->
+            # {"success": true, ...}), so the "Enviado ✅" free-text tail was
+            # NOT deduped and double-sent into a family group. Rather than rely
+            # solely on the fragile counter (whose increment crosses a tool-
+            # executor thread/context boundary and can silently fail to be read
+            # back), ALSO scan the actual turn transcript for a successful
+            # current-chat send. The transcript is ground truth — a
+            # send_message tool result carrying success:true for this chat_id
+            # means a delivery happened, full stop. OR the two signals so
+            # either one triggers the dedup. Never produces a false positive:
+            # a send to a DIFFERENT (explicit) target is refused mid-turn by
+            # the live-turn scope guard, so any successful send_message result
+            # present in a live turn's transcript is necessarily a current-chat
+            # delivery.
+            if not _delivered_via_tool:
+                try:
+                    if self._transcript_has_current_chat_send(agent_messages):
+                        _delivered_via_tool = True
+                except Exception:
+                    logger.debug("transcript send-scan failed", exc_info=True)
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -13487,6 +13511,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         from gateway.reply_policy import ReplyPolicy
         return getattr(source, "reply_policy", None) == ReplyPolicy.FREE_RESPONSE
+
+    @staticmethod
+    def _transcript_has_current_chat_send(agent_messages) -> bool:
+        """True if the turn transcript contains a successful send_message
+        tool result — ground-truth evidence that a current-chat delivery
+        already happened this turn, used as a defense-in-depth dedup signal
+        alongside the turn-scoped reply_gate_tool_sends counter.
+
+        A live gateway turn can only issue send_message with target="current"
+        (the live-turn scope guard in tools/send_message_tool.py refuses any
+        explicit cross-platform target mid-turn), so ANY successful
+        send_message result in a live turn's transcript is necessarily a
+        current-chat delivery — scanning for the tool name + success is
+        sufficient and can't false-positive on a cross-target send.
+
+        Tolerant of both message shapes: a tool-role message with
+        tool_name=="send_message" whose content JSON has success==true, and
+        the OpenAI function-result shape. Defensive: any parse failure on an
+        individual message is skipped, never raised (a bookkeeping scan must
+        never break delivery). (2026-07-12 TAMHAL Y JVic double-send fix.)
+        """
+        import json as _json
+        if not agent_messages:
+            return False
+        for msg in agent_messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "tool":
+                continue
+            # The canonical tool-result builder sets BOTH "tool_name" and
+            # "name" (agent/tool_dispatch_helpers.py), but some synthetic
+            # error-result paths set only "name" — accept either.
+            if "send_message" not in (msg.get("tool_name"), msg.get("name")):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or "success" not in content:
+                continue
+            try:
+                parsed = _json.loads(content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, dict) and parsed.get("success") is True:
+                return True
+        return False
 
     def _should_send_voice_reply(
         self,
