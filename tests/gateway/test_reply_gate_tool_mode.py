@@ -306,7 +306,24 @@ def _agent_result(text):
 
 
 async def _run(runner, src, text):
-    runner._run_agent = AsyncMock(return_value=_agent_result(text))
+    # Reply-gate v2: the authoritative delivery counters live on the
+    # TurnDeliveryState bound inside _handle_message_with_agent, populated by
+    # the send_message tool during the agent run. _run_agent is mocked here, so
+    # simulate the tool's effect by mutating the turn-state the handler binds:
+    # replay the source's intended tool_sends/decided_silent onto the live
+    # TurnDeliveryState from within the mocked run.
+    _intended_sends = int(getattr(src, "reply_gate_tool_sends", 0) or 0)
+    _intended_silent = int(getattr(src, "reply_gate_decided_silent", 0) or 0)
+
+    async def _fake_run_agent(*_a, **_kw):
+        from tools.approval import get_turn_delivery_state
+        _st = get_turn_delivery_state()
+        if _st is not None:
+            _st.tool_sends += _intended_sends
+            _st.decided_silent += _intended_silent
+        return _agent_result(text)
+
+    runner._run_agent = _fake_run_agent
     return await runner._handle_message_with_agent(_event(src), src, _SESSION_KEY, 1)
 
 

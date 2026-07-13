@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Optional
 from hermes_cli.config import cfg_get
 
@@ -232,27 +233,98 @@ def reset_current_message_source(token: contextvars.Token) -> None:
     _current_message_source.reset(token)
 
 
+# ---------------------------------------------------------------------------
+# Turn-scoped delivery state (reply-gate v2, 2026-07-13)
+# ---------------------------------------------------------------------------
+# The reply-gate needs one reliable answer per INBOUND MESSAGE: did the agent
+# deliver to (or explicitly stay silent toward) the originating chat via a
+# send_message tool call, anywhere across the whole turn?
+#
+# The v1 design put counters ON the message-source object. That is unreliable
+# because a single inbound message's turn can span MULTIPLE _run_agent_inner
+# invocations (the re-entrant queued-follow-up chain in gateway/run.py), and
+# each recursive run (a) resets the source counters and (b) binds a DIFFERENT
+# `next_source` object than the outer scope reads. So a send that fires in a
+# follow-up run increments a source the post-turn block never inspects —
+# measured ~44% counter-miss rate in production (group "TAMHAL Y JVic",
+# 2026-07-13).
+#
+# TurnDeliveryState fixes this by identity: the gateway creates ONE state
+# object at the OUTER per-inbound-message scope (_handle_message_with_agent),
+# binds it to this contextvar for the whole turn, and NEVER resets it across
+# the re-entrant chain. Tools mutate it in place (attribute writes survive the
+# executor-thread -> asyncio-loop boundary exactly like the old source-object
+# writes did), and the post-turn block reads the same object. Because there is
+# exactly one instance shared by identity across every follow-up run and every
+# tool-worker thread, the counts are correct regardless of source-object
+# divergence.
+@dataclass
+class TurnDeliveryState:
+    """Per-inbound-message reply-gate decision counters (see module note).
+
+    tool_sends: successful send_message(target="current") deliveries.
+    decided_silent: explicit send_message(target="current", action="silent")
+        decisions.
+    Both accumulate across the entire re-entrant follow-up chain for one
+    inbound message.
+    """
+
+    tool_sends: int = 0
+    decided_silent: int = 0
+
+
+_current_turn_delivery_state: contextvars.ContextVar[Optional["TurnDeliveryState"]] = (
+    contextvars.ContextVar("current_turn_delivery_state", default=None)
+)
+
+
+def set_turn_delivery_state(state: "TurnDeliveryState") -> contextvars.Token:
+    """Bind a fresh TurnDeliveryState for the current inbound-message turn.
+
+    Called ONCE at the outer per-inbound-message scope, before the (possibly
+    re-entrant) agent run chain begins. Must be paired with
+    reset_turn_delivery_state in a finally.
+    """
+    return _current_turn_delivery_state.set(state)
+
+
+def get_turn_delivery_state() -> Optional["TurnDeliveryState"]:
+    """Return the current turn's delivery state, or None outside a gateway turn."""
+    return _current_turn_delivery_state.get()
+
+
+def reset_turn_delivery_state(token: contextvars.Token) -> None:
+    """Restore the prior turn-delivery-state context."""
+    _current_turn_delivery_state.reset(token)
+
+
 def note_current_message_delivered() -> None:
     """Record that the current turn delivered to its originating chat via a tool.
 
-    Increments a turn-scoped counter ON the current message source object (the
-    same object the async post-turn delivery block holds a reference to), so the
-    post-turn block can dedup — a tool-driven send to the current chat means the
-    free-text tail must never also auto-deliver. The counter rides the source
-    object rather than a contextvar because the tool runs in the agent's
-    executor-thread context (a copy) while the post-turn block reads it back on
-    the asyncio loop; mutating the shared object crosses that boundary, a
-    contextvar reset would not. No-op outside a gateway turn.
+    Increments the turn-scoped TurnDeliveryState (the object created once at the
+    outer per-inbound-message scope and shared by identity across the whole
+    re-entrant follow-up chain), so the post-turn delivery block can dedup — a
+    tool-driven send to the current chat means the free-text tail must never
+    also auto-deliver. Attribute writes on the shared state object survive the
+    executor-thread -> asyncio-loop boundary.
+
+    Back-compat: ALSO bumps the legacy source-object counter when a source is
+    bound, so any reader still consulting source.reply_gate_tool_sends keeps
+    working during the migration. No-op outside a gateway turn.
     """
+    state = _current_turn_delivery_state.get()
+    if state is not None:
+        try:
+            state.tool_sends += 1
+        except Exception:
+            pass
+    # Legacy mirror (kept until all readers move to TurnDeliveryState).
     src = _current_message_source.get()
-    if src is None:
-        return
-    try:
-        src.reply_gate_tool_sends = int(getattr(src, "reply_gate_tool_sends", 0) or 0) + 1
-    except Exception:
-        # Source object may be an unexpected shape (defensive: never let a
-        # bookkeeping write break a successful delivery).
-        pass
+    if src is not None:
+        try:
+            src.reply_gate_tool_sends = int(getattr(src, "reply_gate_tool_sends", 0) or 0) + 1
+        except Exception:
+            pass
 
 
 def note_current_message_silent() -> None:
@@ -264,22 +336,25 @@ def note_current_message_silent() -> None:
     of one. Under ``reply_gate_mode="tool"`` a free-response group turn that
     calls neither is a turn that never DECIDED anything; the post-turn
     delivery block treats that non-decision differently from an explicit
-    silent call (see gateway/run.py's reply-gate telemetry). Same turn-scoped
-    counter mechanics as note_current_message_delivered: mutates the shared
-    source object (not a contextvar) so the write survives the executor
-    thread -> asyncio loop boundary. No-op outside a gateway turn.
+    silent call (see gateway/run.py's reply-gate telemetry). Same TurnDeliveryState
+    mechanics as note_current_message_delivered, with a legacy source-object
+    mirror. No-op outside a gateway turn.
     """
+    state = _current_turn_delivery_state.get()
+    if state is not None:
+        try:
+            state.decided_silent += 1
+        except Exception:
+            pass
+    # Legacy mirror (kept until all readers move to TurnDeliveryState).
     src = _current_message_source.get()
-    if src is None:
-        return
-    try:
-        src.reply_gate_decided_silent = int(
-            getattr(src, "reply_gate_decided_silent", 0) or 0
-        ) + 1
-    except Exception:
-        # Source object may be an unexpected shape (defensive: never let a
-        # bookkeeping write break a successful decision).
-        pass
+    if src is not None:
+        try:
+            src.reply_gate_decided_silent = int(
+                getattr(src, "reply_gate_decided_silent", 0) or 0
+            ) + 1
+        except Exception:
+            pass
 
 
 def get_current_session_key(default: str = "default") -> str:

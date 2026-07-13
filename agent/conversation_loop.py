@@ -5298,16 +5298,23 @@ def run_conversation(
                             build_reply_decision_nudge,
                             reply_decision_nudge_enabled,
                         )
-                        from tools.approval import get_current_message_source
+                        from tools.approval import get_turn_delivery_state
 
                         if reply_decision_nudge_enabled():
-                            _src = get_current_message_source()
+                            # Reply-gate v2: read decision counters from the
+                            # identity-stable TurnDeliveryState (shared across
+                            # the whole re-entrant chain + tool-worker threads),
+                            # NOT the per-source counters — those diverge across
+                            # follow-up runs and made this nudge misfire. When
+                            # no state is bound (not a live gateway turn) the
+                            # counts are 0, which correctly means "undecided".
+                            _tstate = get_turn_delivery_state()
                             _reply_nudge = build_reply_decision_nudge(
                                 tool_sends=int(
-                                    getattr(_src, "reply_gate_tool_sends", 0) or 0
+                                    getattr(_tstate, "tool_sends", 0) or 0
                                 ),
                                 decided_silent=int(
-                                    getattr(_src, "reply_gate_decided_silent", 0) or 0
+                                    getattr(_tstate, "decided_silent", 0) or 0
                                 ),
                                 attempts=getattr(agent, "_reply_decision_nudges", 0),
                             )

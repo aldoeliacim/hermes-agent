@@ -141,20 +141,32 @@ def test_env_var_overrides_config(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Integration: conversation_loop wiring reads reply_gate_tool_sends /
-# reply_gate_decided_silent off the SAME contextvar-bound source object the
-# gateway's post-turn delivery block reads (tools/approval.py). Confirms the
-# nudge module's inputs are wired to the real counters, not a parallel state.
+# Integration: conversation_loop wiring reads the reply-gate decision counters
+# off the identity-stable TurnDeliveryState (reply-gate v2, tools/approval.py)
+# that the gateway's post-turn delivery block also reads — a single shared
+# ledger, not the per-source counters that diverged across the re-entrant
+# follow-up chain. Confirms the nudge module's inputs are wired to the real
+# counters, not a parallel state.
 # --------------------------------------------------------------------------- #
 
 
 def test_nudge_inputs_match_approval_module_counter_names():
-    """The two counters this module reads must be the exact attribute names
-    tools/approval.py's note_current_message_delivered/silent() write to —
-    a name drift here would silently defeat the whole guard."""
+    """The two counters this module reads must be the exact field names
+    tools/approval.py's note_current_message_delivered/silent() write to on
+    the TurnDeliveryState — a name drift here would silently defeat the whole
+    guard. The legacy source-object mirror is also asserted for back-compat."""
+    from tools.approval import TurnDeliveryState
     from gateway.session import SessionSource
     from gateway.config import Platform
 
+    # v2 authoritative ledger.
+    state = TurnDeliveryState()
+    assert hasattr(state, "tool_sends")
+    assert hasattr(state, "decided_silent")
+    assert state.tool_sends == 0
+    assert state.decided_silent == 0
+
+    # Legacy back-compat mirror still present on the source object.
     src = SessionSource(platform=Platform.WHATSAPP, chat_id="123@g.us", chat_type="group")
     assert hasattr(src, "reply_gate_tool_sends")
     assert hasattr(src, "reply_gate_decided_silent")

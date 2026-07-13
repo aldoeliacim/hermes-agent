@@ -11877,6 +11877,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        # Reply-gate v2 (2026-07-13): create ONE TurnDeliveryState for this
+        # whole inbound-message turn and bind it for the entire (possibly
+        # re-entrant queued-follow-up) agent run chain. Tools mutate this single
+        # object by identity — immune to the source-object divergence that made
+        # the v1 per-source counters ~44% unreliable. Reset in the finally below.
+        from tools.approval import (
+            TurnDeliveryState,
+            set_turn_delivery_state,
+            reset_turn_delivery_state,
+        )
+        _turn_delivery_state = TurnDeliveryState()
+        _turn_delivery_state_token = set_turn_delivery_state(_turn_delivery_state)
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -11968,9 +11981,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # reliable primary signal. See `_transcript_has_current_chat_send`
             # for the authoritative check computed once `agent_messages` is
             # available below.
-            _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
+            # Reply-gate v2 (2026-07-13): read the turn-scoped delivery count
+            # from the TurnDeliveryState bound at the outer scope — the ONE
+            # object shared by identity across the entire re-entrant follow-up
+            # chain and every tool-worker thread, so it counts sends that fire
+            # in ANY follow-up run (the v1 per-source counter missed those ~44%
+            # of the time). Fall back to the legacy source-object counter only
+            # if the state is somehow unbound (defensive; should not happen in
+            # a live gateway turn).
+            _turn_state = _turn_delivery_state
+            if _turn_state is not None:
+                _tool_send_count = int(getattr(_turn_state, "tool_sends", 0) or 0)
+            else:
+                _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
             _delivered_via_tool = _tool_send_count > 0
-            # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
             # produce visible content after exhausting all retries (nudge,
             # prefill, empty-retry, fallback).  Sending the raw sentinel
@@ -12530,9 +12554,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to lose by suppressing, so it keeps the quiet "undecided"
             # outcome at INFO.
             if tool_gated or _delivered_via_tool:
-                _decided_silent = int(
-                    getattr(source, "reply_gate_decided_silent", 0) or 0
-                ) > 0
+                # Reply-gate v2: prefer the identity-stable TurnDeliveryState
+                # for the silent decision too; legacy source counter only if
+                # unbound (defensive).
+                if _turn_state is not None:
+                    _decided_silent = int(getattr(_turn_state, "decided_silent", 0) or 0) > 0
+                else:
+                    _decided_silent = int(
+                        getattr(source, "reply_gate_decided_silent", 0) or 0
+                    ) > 0
                 if _delivered_via_tool:
                     # Dedup (defense in depth): a tool-driven send already
                     # delivered to this chat, so the free-text tail must never
@@ -12755,6 +12785,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Reply-gate v2: unbind the per-inbound-message TurnDeliveryState.
+            try:
+                reset_turn_delivery_state(_turn_delivery_state_token)
+            except Exception:
+                pass
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
@@ -19628,9 +19663,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_token = set_current_session_key(_approval_session_key)
             # Bind the inbound source for this turn so send_message(target="current")
             # can resolve the originating chat. Same lifetime + crash-safety as the
-            # session-key registration (reset in the finally below). Zero the
-            # per-turn tool-send counter first so a reused source object never
-            # carries a stale count into a new turn.
+            # session-key registration (reset in the finally below).
+            #
+            # Reply-gate v2 (2026-07-13): the authoritative delivery counters
+            # now live on the TurnDeliveryState bound ONCE at the outer
+            # per-inbound-message scope (_handle_message_with_agent), which is
+            # deliberately NOT reset here — so a send that fires in ANY
+            # re-entrant follow-up run still counts toward the one turn-state
+            # the post-turn block reads. These source-object counters are a
+            # legacy back-compat mirror only; zeroing them per-run is harmless
+            # (nothing correctness-critical reads them anymore) but kept so any
+            # lingering reader sees a clean per-run value.
             try:
                 source.reply_gate_tool_sends = 0
                 source.reply_gate_decided_silent = 0
