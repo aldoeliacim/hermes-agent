@@ -212,6 +212,71 @@ class TestBusySessionAck:
         agent.interrupt.assert_called_once_with("Are you working?")
 
     @pytest.mark.asyncio
+    async def test_group_chat_suppresses_ack_but_still_interrupts(self):
+        """2026-07-12 fix: in a multi-party chat (group/channel/thread) the
+        busy/interrupt ack bubble is noise — an untranslated English status
+        line dropped into other people's conversation (CONFIRMED leak into
+        the Spanish family group 'TAMHAL Y JVic'). The message must still be
+        interrupted/processed; ONLY the ack bubble is withheld."""
+        for chat_type in ("group", "channel", "thread"):
+            runner, sentinel = _make_runner()
+            runner._busy_input_mode = "interrupt"
+            adapter = _make_adapter()
+
+            event = _make_event(text="Pasen las fotos")
+            event.source.chat_type = chat_type
+            sk = build_session_key(event.source)
+
+            agent = MagicMock()
+            agent.get_activity_summary.return_value = {
+                "api_call_count": 2, "max_iterations": 60,
+                "current_tool": None, "last_activity_ts": time.time(),
+                "last_activity_desc": "", "seconds_since_activity": 1.0,
+            }
+            runner._running_agents[sk] = agent
+            runner._running_agents_ts[sk] = time.time() - 60
+            runner.adapters[event.source.platform] = adapter
+
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+            assert result is True, f"{chat_type}: must report handled"
+            # NO ack bubble sent to the group.
+            adapter._send_with_retry.assert_not_called()
+            # But the running turn was STILL interrupted — suppression is
+            # cosmetic only, never changes the interrupt/queue behavior.
+            agent.interrupt.assert_called_once_with("Pasen las fotos")
+
+    @pytest.mark.asyncio
+    async def test_dm_still_gets_ack_after_group_suppression(self):
+        """The suppression is scoped to multi-party chats only — a 1:1 DM
+        must still receive the busy ack (the one person waiting wants to
+        know the bot heard them)."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = _make_event(text="¿estás ahí?")
+        event.source.chat_type = "dm"
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 3, "max_iterations": 60, "current_tool": None,
+            "last_activity_ts": time.time(), "last_activity_desc": "",
+            "seconds_since_activity": 1.0,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 60
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        # DM keeps the ack.
+        adapter._send_with_retry.assert_called_once()
+        agent.interrupt.assert_called_once_with("¿estás ahí?")
+
+    @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):
         """When busy_input_mode is 'queue', message is queued WITHOUT interrupt."""
         runner, sentinel = _make_runner()

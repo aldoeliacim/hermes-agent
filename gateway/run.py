@@ -5733,6 +5733,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
+        # Suppress the busy/interrupt ack in multi-party chats (2026-07-12): a
+        # "⚡ Interrupting current task" / "⏳ Queued..." status bubble is
+        # useful in a 1:1 DM (the one person waiting wants to know the bot
+        # heard them and is busy), but in a group/channel/thread it's pure
+        # noise — an untranslated English status line dropped into an active
+        # conversation between other people (CONFIRMED leak: the ack landing
+        # in the Spanish family group "TAMHAL Y JVic" mid-conversation). The
+        # input is still processed/interrupted exactly as before; only the
+        # acknowledgment bubble is withheld. Suppress ONLY the genuinely
+        # multi-party chat_types (group/channel/thread) — DMs and 1:1-style
+        # programmatic channels (webhook, or any future non-multi-party type)
+        # keep the ack. Gated on chat_type so it's a precise, self-explaining
+        # discriminator rather than a config knob the user would have to find.
+        _chat_type = getattr(getattr(event, "source", None), "chat_type", "dm")
+        if _chat_type in ("group", "channel", "thread"):
+            logger.debug(
+                "Busy ack suppressed for multi-party chat (type=%s) session %s",
+                _chat_type, session_key,
+            )
+            return True  # input still processed/interrupted, just no ack bubble
+
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
         # read just to discover that no ack will be sent.
