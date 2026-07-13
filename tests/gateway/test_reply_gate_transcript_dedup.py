@@ -123,3 +123,20 @@ def test_non_dict_messages_are_skipped():
             {"role": "tool", "tool_name": "send_message",
              "content": '{"success": true}'}]
     assert _scan(msgs) is True
+
+
+def test_send_message_target_guidance_discourages_post_send_narration():
+    """The send_message tool 'target' description must explicitly tell the
+    model NOT to add a confirmation/status tail after target='current'. This
+    is the source-level fix for the 'Enviado ✅' narration the model emitted
+    on ~26% of group turns (2026-07-13 2-day analysis). If this guidance is
+    removed the model reverts to double-message narration, so lock it."""
+    from tools.send_message_tool import SEND_MESSAGE_SCHEMA
+    target_desc = SEND_MESSAGE_SCHEMA["parameters"]["properties"]["target"]["description"]
+    lowered = target_desc.lower()
+    # Must mention the anti-narration rule and at least one exemplar token.
+    assert "do not" in lowered
+    assert "confirmation" in lowered or "status line" in lowered
+    assert "enviado" in lowered or "sent" in lowered
+    assert "duplicate" in lowered
+

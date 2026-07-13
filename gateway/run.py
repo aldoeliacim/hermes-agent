@@ -11956,8 +11956,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _reply_policy = getattr(source, "reply_policy", None)
             tool_gated = self._is_reply_tool_gated(source)
             # Turn-scoped count of current-chat tool deliveries (send_message
-            # target="current"); read back off the shared source object the tool
-            # mutated during the turn. Drives dedup regardless of tool_gated.
+            # target="current"), read back off the source object the tool
+            # mutated during the turn. This counter is a FAST-PATH HINT only —
+            # 2-day production measurement (2026-07-13, group "TAMHAL Y JVic")
+            # showed it wrong ~44% of the time: it read 0 on turns whose
+            # transcript proved a successful send, because the counter is
+            # mutable state on an object whose identity diverges across the
+            # turn lifecycle (tool-executor thread boundary on the increment;
+            # re-entrant queued-follow-up runs bind a DIFFERENT `next_source`
+            # object than the one the reply-gate reads here). It is NOT a
+            # reliable primary signal. See `_transcript_has_current_chat_send`
+            # for the authoritative check computed once `agent_messages` is
+            # available below.
             _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
             _delivered_via_tool = _tool_send_count > 0
             # Convert the agent's internal "(empty)" sentinel into a
@@ -11972,31 +11982,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
-            # Defense-in-depth dedup signal (2026-07-12 "TAMHAL Y JVic" leak):
-            # the turn-scoped counter `reply_gate_tool_sends` is the primary
-            # signal that a send_message(target="current") delivered this turn,
-            # but a CONFIRMED production leak showed the counter reading 0 even
-            # though the transcript proves a send_message with a success result
-            # fired (msg 199272-199274: send_message(target='current') ->
-            # {"success": true, ...}), so the "Enviado ✅" free-text tail was
-            # NOT deduped and double-sent into a family group. Rather than rely
-            # solely on the fragile counter (whose increment crosses a tool-
-            # executor thread/context boundary and can silently fail to be read
-            # back), ALSO scan the actual turn transcript for a successful
-            # current-chat send. The transcript is ground truth — a
-            # send_message tool result carrying success:true for this chat_id
-            # means a delivery happened, full stop. OR the two signals so
-            # either one triggers the dedup. Never produces a false positive:
-            # a send to a DIFFERENT (explicit) target is refused mid-turn by
-            # the live-turn scope guard, so any successful send_message result
-            # present in a live turn's transcript is necessarily a current-chat
-            # delivery.
-            if not _delivered_via_tool:
-                try:
-                    if self._transcript_has_current_chat_send(agent_messages):
-                        _delivered_via_tool = True
-                except Exception:
-                    logger.debug("transcript send-scan failed", exc_info=True)
+            # AUTHORITATIVE dedup signal: scan the immutable turn transcript
+            # for a successful current-chat send. Unlike the mutable
+            # `reply_gate_tool_sends` counter above (measured ~44% unreliable
+            # in production — see its comment), the transcript is ground truth
+            # a re-entrant follow-up run or a tool-executor thread boundary
+            # cannot corrupt: agent_result["messages"] is the actual sequence
+            # the model produced this turn, and a send_message tool result
+            # carrying success:true is proof a delivery happened. A live turn
+            # can only send with target="current" (the live-turn scope guard
+            # refuses explicit cross-target sends mid-turn), so any successful
+            # send_message result here is necessarily a current-chat delivery
+            # and safe to dedup against. Record the counter-vs-transcript
+            # divergence at WARNING so the burn-in review can see how often the
+            # counter fast-path misses (and confirm the transcript scan is
+            # carrying the real load).
+            _transcript_delivered = False
+            try:
+                _transcript_delivered = self._transcript_has_current_chat_send(agent_messages)
+            except Exception:
+                logger.debug("transcript send-scan failed", exc_info=True)
+            if _transcript_delivered and not _delivered_via_tool:
+                logger.warning(
+                    "reply_gate: counter MISS — transcript proves a current-chat "
+                    "send but reply_gate_tool_sends=%d (session=%s). Transcript "
+                    "scan is authoritative; counter is a fast-path hint only.",
+                    _tool_send_count,
+                    getattr(session_entry, "session_id", "?"),
+                )
+            # The transcript is authoritative — OR it in (either signal
+            # triggers the dedup; the counter can only add false-negatives,
+            # never false-positives, so this is monotonic and safe).
+            _delivered_via_tool = _delivered_via_tool or _transcript_delivered
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
