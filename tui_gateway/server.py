@@ -4864,11 +4864,14 @@ def _resolve_runtime_with_fallback(
             if not fb_provider:
                 continue
             try:
+                from hermes_cli.fallback_config import resolve_entry_api_key
+
                 fb_kwargs: dict = {"requested": fb_provider}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
-                if entry.get("api_key"):
-                    fb_kwargs["explicit_api_key"] = entry["api_key"]
+                fb_api_key = resolve_entry_api_key(entry)
+                if fb_api_key:
+                    fb_kwargs["explicit_api_key"] = fb_api_key
                 runtime = resolve_runtime_provider(**fb_kwargs)
                 import logging
 
