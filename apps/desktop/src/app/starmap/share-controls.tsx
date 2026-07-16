@@ -76,8 +76,8 @@ export function ShareControls({ imported = false, onImport, onResetMap, shareCod
         }}
         open={open}
       >
-        <Tip label={t.starmap.shareTitle}>
-          <DialogTrigger asChild>
+        <DialogTrigger asChild>
+          <Tip label={t.starmap.shareTitle}>
             <Button
               aria-label={t.starmap.shareTitle}
               className="text-muted-foreground hover:text-foreground"
@@ -86,8 +86,8 @@ export function ShareControls({ imported = false, onImport, onResetMap, shareCod
             >
               <Upload className="size-3.5" />
             </Button>
-          </DialogTrigger>
-        </Tip>
+          </Tip>
+        </DialogTrigger>
 
         <DialogContent className="max-w-md">
           <DialogHeader>

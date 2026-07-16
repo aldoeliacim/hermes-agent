@@ -36,7 +36,6 @@ import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { LayoutDashboard } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { Codecs, persistentAtom } from '@/lib/persisted'
-import { toggleKeybindPanel } from '@/store/keybinds'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -300,7 +299,7 @@ registry.registerMany([
       id: 'keybinds.panel',
       label: 'Keyboard shortcuts',
       keywords: ['keybinds', 'shortcuts', 'hotkeys', 'keyboard'],
-      run: toggleKeybindPanel
+      run: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds'))
     } satisfies PaletteContribution
   }
 ])
