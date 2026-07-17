@@ -92,6 +92,9 @@ def _canonical_silence_candidates(text: str) -> tuple[str, ...]:
 _REPLY_GATE_JARGON_RE = re.compile(r"\breply[\s\-]?gate\b", re.IGNORECASE)
 
 # Tier A — first-person / definitive stay-silent decision (the leaked CoT voice).
+# Includes Spanish equivalents: the model's decision-log voice follows the chat
+# language, so a Spanish-chat leak ("Silencio deliberado", "nada que responder",
+# "no respondo") must be caught too — English-only tells let real leaks through.
 _SILENCE_DECISION_TIER_A_RES = (
     re.compile(r"\b(?:i|i'?ll|i\s+will)\s+(?:stay|remain)\s+(?:silent|quiet)\b", re.IGNORECASE),
     re.compile(r"\bno\s+message\s+(?:sent|is\s+sent)\b", re.IGNORECASE),
@@ -101,6 +104,14 @@ _SILENCE_DECISION_TIER_A_RES = (
     re.compile(r"\bwas\s*n'?t\s+addressed\b", re.IGNORECASE),
     re.compile(r"\b(?:i\s+)?(?:do\s+not|don'?t|won'?t|will\s+not)\s+reply\b", re.IGNORECASE),
     re.compile(r"\bi\s+stay\s+silent\b", re.IGNORECASE),
+    # Spanish first-person / definitive stay-silent decision.
+    re.compile(r"\bsilencio\s+deliberado\b", re.IGNORECASE),
+    re.compile(r"\bnada\s+(?:que|a)\s+responder\b", re.IGNORECASE),
+    re.compile(r"\bnada\s+accionable\s+que\s+responder\b", re.IGNORECASE),
+    re.compile(r"\b(?:no\s+respondo|no\s+voy\s+a\s+responder|no\s+contesto)\b", re.IGNORECASE),
+    re.compile(r"\b(?:me\s+)?(?:quedo|permanezco)\s+(?:en\s+)?silencio\b", re.IGNORECASE),
+    re.compile(r"\bno\s+(?:me\s+)?(?:mencion|interpel|aludi|invoc)\w*\s*(?:a\s+m[ií])?\b", re.IGNORECASE),
+    re.compile(r"\bno\s+(?:hay\s+)?mensaje\s+(?:que\s+)?(?:enviar|entregar)\b", re.IGNORECASE),
 )
 
 # Tier B — contextual support; never decisive on its own.
@@ -110,6 +121,11 @@ _SILENCE_DECISION_TIER_B_RES = (
     re.compile(r"\bstay(?:ing)?\s+silent\b", re.IGNORECASE),
     re.compile(r"\bremain\s+silent\b", re.IGNORECASE),
     re.compile(r"\bambient\s+(?:conversation|banter|chatter)\b", re.IGNORECASE),
+    # Spanish contextual support.
+    re.compile(r"\bsin\s+texto(?:\s+acompa\w+)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:reacci[oó]n|reacciona\w*)\s+\S+\s+de\s+\w+", re.IGNORECASE),
+    re.compile(r"\b(?:banter|charla|conversaci[oó]n)\s+(?:entre|ambient\w*)\b", re.IGNORECASE),
+    re.compile(r"\bentre\s+(?:otras\s+)?personas\b", re.IGNORECASE),
 )
 
 # Only scan short responses — a leaked decision-log is terse. A genuine long
