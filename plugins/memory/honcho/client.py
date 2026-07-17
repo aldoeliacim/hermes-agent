@@ -856,8 +856,29 @@ class HonchoClientConfig:
 
 _honcho_client_slot: SingletonSlot = SingletonSlot()
 _cached_timeout: float | None = None
-# Same memoization for the honcho.json-derived timeout; mtime -1 = file absent.
+# Memo for the honcho.json-derived timeout, keyed on the file's mtime_ns so
+# the staleness check on every get_honcho_client() call costs one stat()
+# instead of a JSON parse. mtime -1 = file absent; (None, None) = not yet
+# populated. config.yaml needs no such memo: load_config_readonly() is
+# internally cached on both the user and managed files' signatures, and a
+# bespoke key here would have to duplicate that invalidation logic.
 _honcho_json_timeout_memo: tuple[int | None, float | None] = (None, None)
+
+
+def _config_yaml_timeout() -> float | None:
+    """Read honcho.timeout / honcho.request_timeout via the cached config loader."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        honcho_cfg = load_config_readonly().get("honcho", {})
+        if isinstance(honcho_cfg, dict):
+            return _resolve_optional_float(
+                honcho_cfg.get("timeout"),
+                honcho_cfg.get("request_timeout"),
+            )
+        return None
+    except Exception:
+        return None
 
 
 def _honcho_json_timeout() -> float | None:
@@ -905,18 +926,7 @@ def _resolve_timeout_from_sources(config: HonchoClientConfig | None) -> float:
         if timeout is None:
             timeout = _resolve_optional_float(os.environ.get("HONCHO_TIMEOUT"))
     if timeout is None:
-        try:
-            from hermes_cli.config import load_config
-
-            hermes_cfg = load_config()
-            honcho_cfg = hermes_cfg.get("honcho", {})
-            if isinstance(honcho_cfg, dict):
-                timeout = _resolve_optional_float(
-                    honcho_cfg.get("timeout"),
-                    honcho_cfg.get("request_timeout"),
-                )
-        except Exception:
-            pass
+        timeout = _config_yaml_timeout()
     return timeout if timeout is not None else _DEFAULT_HTTP_TIMEOUT
 
 
