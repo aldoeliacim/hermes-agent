@@ -1,4 +1,3 @@
-
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -6,6 +5,7 @@ import http from 'node:http'
 import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
+import tls from 'node:tls'
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -67,7 +67,6 @@ import {
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
-import { resolvePickerDefaultPath } from './wsl-path-bridge'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
 import {
@@ -86,7 +85,14 @@ import {
   reviewUnstage
 } from './git-review-ops'
 import { gitRootForIpc } from './git-root'
-import { addWorktree, listBaseBranches, listBranches, listWorktrees, removeWorktree, switchBranch } from './git-worktree-ops'
+import {
+  addWorktree,
+  listBaseBranches,
+  listBranches,
+  listWorktrees,
+  removeWorktree,
+  switchBranch
+} from './git-worktree-ops'
 import {
   DATA_URL_READ_MAX_BYTES,
   DEFAULT_FETCH_TIMEOUT_MS,
@@ -107,7 +113,6 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
-import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
@@ -132,10 +137,17 @@ import {
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
-import { buildPathExtCandidates, chooseUpdaterArgs, getVenvSitePackagesEntries, resolveVenvHermesCommand } from './windows-hermes-path'
+import {
+  buildPathExtCandidates,
+  chooseUpdaterArgs,
+  getVenvSitePackagesEntries,
+  resolveVenvHermesCommand
+} from './windows-hermes-path'
+import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
+import { resolvePickerDefaultPath } from './wsl-path-bridge'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -4793,46 +4805,22 @@ function installZoomShortcuts(window) {
   window.webContents.on('before-input-event', (event, input) => {
     const mod = IS_MAC ? input.meta : input.control
 
-    if (!mod || input.alt) {
+    if (!mod || input.alt || input.shift) {
       return
     }
 
     const key = input.key
 
     if (key === '0') {
-      if (input.shift) {
-        return // Ctrl/Cmd+Shift+0 is not a zoom chord — leave it alone
-      }
-
       event.preventDefault()
       setAndPersistZoomLevel(window, 0)
     } else if (key === '=' || key === '+') {
-      // Zoom-in must accept the shift modifier: on US layouts Plus is
-      // physically Shift+=, so Cmd+Plus arrives as Cmd+Shift+'+' (or '='
-      // depending on platform). The old blanket shift guard silently
-      // dropped keyboard zoom-in on macOS (#43517).
       event.preventDefault()
       setAndPersistZoomLevel(window, window.webContents.getZoomLevel() + ZOOM_STEP)
     } else if (key === '-') {
-      if (input.shift) {
-        return // Shift+'-' is '_' territory on most layouts, not zoom-out
-      }
-
       event.preventDefault()
       setAndPersistZoomLevel(window, window.webContents.getZoomLevel() - ZOOM_STEP)
     }
-  })
-
-  // Ctrl/Cmd + mouse wheel — the standard desktop/browser zoom gesture
-  // (#40295). Chromium surfaces it as the main-process 'zoom-changed' event
-  // (wheel events are DOM-side, so before-input-event never sees them).
-  // Route through the same persist+notify funnel as the keyboard shortcuts
-  // so wheel zoom survives restarts and the settings Scale control stays in
-  // sync, and use the same half step for consistency.
-  window.webContents.on('zoom-changed', (event, zoomDirection) => {
-    event.preventDefault()
-    const delta = zoomDirection === 'in' ? ZOOM_STEP : -ZOOM_STEP
-    setAndPersistZoomLevel(window, window.webContents.getZoomLevel() + delta)
   })
 }
 
@@ -5516,6 +5504,7 @@ function openPortalLoginWindow() {
       if (settled) {
         return
       }
+
       settled = true
 
       if (pollTimer) {
@@ -5602,6 +5591,7 @@ async function discoverCloudAgents(org?: string) {
     const err = new Error(
       'You are not signed in to Hermes Cloud. Open Settings → Gateway, choose Hermes Cloud, and sign in.'
     ) as any
+
     err.needsCloudLogin = true
     throw err
   }
@@ -5970,6 +5960,7 @@ function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
     authMode,
     token
   }
+
   const orgValue = typeof org === 'string' ? org.trim() : ''
 
   if (orgValue) {
@@ -6976,6 +6967,7 @@ async function startHermes() {
     }
 
     const message = error instanceof Error ? error.message : String(error)
+
     // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
     // timeout / host briefly unreachable across sleep) is transient and has no
     // child 'exit' handler to clear the cache — latching it would wedge the app
@@ -6984,6 +6976,7 @@ async function startHermes() {
     if (shouldLatchBackendStartFailure({ attemptedRemote })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
     }
+
     updateBootProgress(
       {
         error: message,
@@ -7015,17 +7008,16 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+
   if (zoom) {
     installZoomShortcuts(win)
-    // Re-apply persisted zoom on show/restore/resize/cross-display move
-    // (Chromium can drop webContents zoom after these window transitions) and
-    // on EVERY full load — not once. The crash-recovery path calls
-    // webContents.reload(), which fires did-finish-load again after a `once`
-    // listener is spent, so zoom was silently lost on renderer crash
-    // recovery and any in-place reload/navigation (#46429).
+    // Re-apply persisted zoom on show/restore/cross-display move (Windows can
+    // drop webContents zoom after minimize or a monitor-scale change) and on
+    // first load (reloads / crash recovery).
     installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
-    win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
+    win.webContents.once('did-finish-load', () => restorePersistedZoomLevel(win))
   }
+
   installContextMenu(win)
   win.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
@@ -7417,20 +7409,12 @@ function createWindow() {
     mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
   }
 
-  // Start the Python backend NOW, in parallel with the renderer load — not on
-  // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
-  // is the dominant startup cost, and serializing it behind Chromium's load
-  // added the whole renderer load time to first-usable-composer. The promise is
-  // shared (backendConnectionState), so the renderer's getConnection() joins
-  // this in-flight boot instead of duplicating it; early boot-progress events
-  // the renderer misses are recovered by its getBootProgress() pull on mount.
-  startHermes().catch(error => rememberLog(error.stack || error.message))
-
   mainWindow.webContents.once('did-finish-load', () => {
     // Zoom restore is handled by wireCommonWindowHandlers (shared with session
     // windows); no need to reapply it here.
     broadcastBootProgress()
     sendWindowStateChanged()
+    startHermes().catch(error => rememberLog(error.stack || error.message))
   })
 }
 
@@ -7851,71 +7835,6 @@ async function interceptSessionRequestForRemote(request) {
     return mergeRemoteProfileSessions(searchParams, remoteProfiles)
   }
 
-  // Batched sidebar slices. With no remote profiles the local batched endpoint
-  // (one DB open per profile) serves it directly — take the fast path. When
-  // remotes exist, fan the three slices back out to the per-slice
-  // /api/profiles/sessions path (which already merges remote rows correctly) and
-  // reassemble; local profiles fall back to three primary reads there, but
-  // remote correctness is preserved.
-  if (method === 'GET' && pathname === '/api/profiles/sessions/sidebar') {
-    const remoteProfiles = configuredRemoteProfileNames()
-
-    if (remoteProfiles.length === 0) {
-      return undefined // local fast path → batched endpoint's single DB open
-    }
-
-    const recentsProfile = (searchParams.get('recents_profile') || 'all').trim() || 'all'
-
-    const sliceParams = (limitKey, defaultLimit, extra) => {
-      const sp = new URLSearchParams({
-        limit: searchParams.get(limitKey) || defaultLimit,
-        offset: '0',
-        min_messages: '1',
-        archived: 'exclude',
-        order: 'recent',
-        ...extra
-      })
-
-      return sp
-    }
-
-    const recentsSp = sliceParams('recents_limit', '20', { profile: recentsProfile })
-    const recentsExclude = searchParams.get('recents_exclude')
-
-    if (recentsExclude) {
-      recentsSp.set('exclude_sources', recentsExclude)
-    }
-
-    const cronSp = sliceParams('cron_limit', '50', { profile: 'all', source: 'cron' })
-
-    const messagingSp = sliceParams('messaging_limit', '100', { profile: 'all' })
-    const messagingExclude = searchParams.get('messaging_exclude')
-
-    if (messagingExclude) {
-      messagingSp.set('exclude_sources', messagingExclude)
-    }
-
-    const [recents, cron, messaging] = await Promise.all([
-      fetchProfilesSessionSlice(recentsSp, remoteProfiles),
-      fetchProfilesSessionSlice(cronSp, remoteProfiles),
-      fetchProfilesSessionSlice(messagingSp, remoteProfiles)
-    ])
-
-    return {
-      recents: {
-        sessions: rowsOf(recents),
-        total: Number(recents?.total) || 0,
-        profile_totals: recents?.profile_totals || {}
-      },
-      cron: { sessions: rowsOf(cron) },
-      messaging: {
-        sessions: rowsOf(messaging),
-        total: Number(messaging?.total) || rowsOf(messaging).length
-      },
-      errors: []
-    }
-  }
-
   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
   // (mutations). Two remote shapes:
   //  - per-profile override: route to that profile's own remote, sans profile
@@ -7978,30 +7897,6 @@ async function remoteSessionList(profile, searchParams) {
   }
 
   return { ...(data as any), sessions: rowsOf(data) }
-}
-
-// Resolve one /api/profiles/sessions slice with remote profiles spliced in —
-// the same branch logic as the GET /api/profiles/sessions intercept, but always
-// returns data (never `undefined`) so a batched caller can compose slices. A
-// specific local profile reads from the local primary; a remote-override profile
-// reads from its remote; 'all' merges every remote into the primary aggregate.
-async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
-  const requested = (searchParams.get('profile') || 'all').trim() || 'all'
-
-  if (requested !== 'all') {
-    if (profileHasRemoteOverride(requested)) {
-      return remoteSessionList(requested, searchParams)
-    }
-
-    const primary = await ensureBackend(null)
-
-    return fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-      method: 'GET',
-      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-    }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
-  }
-
-  return mergeRemoteProfileSessions(searchParams, remoteProfiles)
 }
 
 // Unified list: primary's local aggregate, with each remote profile's stale local
@@ -8714,9 +8609,7 @@ ipcMain.handle('hermes:git:branchSwitch', async (_event, repoPath, branch) =>
 
 ipcMain.handle('hermes:git:branchList', async (_event, repoPath) => listBranches(repoPath, resolveGitBinary()))
 
-ipcMain.handle('hermes:git:baseBranchList', async (_event, repoPath) =>
-  listBaseBranches(repoPath, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:baseBranchList', async (_event, repoPath) => listBaseBranches(repoPath, resolveGitBinary()))
 
 // Compact repo status (branch, ahead/behind, change counts + files) for the
 // composer coding rail. Returns null on a non-repo / remote backend so the rail
@@ -8770,39 +8663,7 @@ ipcMain.handle('hermes:git:scanRepos', async (_event, roots, options) => {
   }
 })
 
-// node-pty's published tarball ships the POSIX `spawn-helper` without an exec
-// bit; the dev flow resolves node-pty straight from node_modules (nothing
-// chmods it there), so the first terminal spawn dies with `posix_spawnp
-// failed`. Restore the bit once, lazily, right before the first spawn. Packaged
-// builds already stage an executable copy, so this is a no-op there.
-let _spawnHelperEnsured = false
-
-function ensureNodePtySpawnHelper() {
-  if (_spawnHelperEnsured || IS_WINDOWS) {
-    return
-  }
-
-  _spawnHelperEnsured = true
-
-  try {
-    const nodePtyRoot = path.dirname(require.resolve('node-pty/package.json'))
-    const { fixed, errors } = ensureSpawnHelperExecutable(nodePtyRoot)
-
-    for (const helperPath of fixed) {
-      rememberLog(`[terminal] restored +x on node-pty spawn-helper: ${helperPath}`)
-    }
-
-    for (const failure of errors) {
-      rememberLog(`[terminal] could not chmod spawn-helper ${failure.path}: ${failure.error}`)
-    }
-  } catch (error) {
-    rememberLog(`[terminal] spawn-helper exec check skipped: ${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
-  ensureNodePtySpawnHelper()
-
   const id = crypto.randomUUID()
   const { args, command, name } = terminalShellCommand()
   const cwd = safeTerminalCwd(payload?.cwd)
@@ -9295,6 +9156,16 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  const systemCa = installWindowsSystemCaTrust(tls)
+
+  if (systemCa.applied) {
+    rememberLog(
+      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
+    )
+  } else if (systemCa.error) {
+    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
+  }
+
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
