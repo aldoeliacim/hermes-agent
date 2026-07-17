@@ -1658,6 +1658,7 @@ export const en: Translations = {
       finishedUnread: 'Finished — unread',
       backgroundRunning: 'Background task running',
       handoffOrigin: platform => `Handed off from ${platform}`,
+      ownedByProfile: profile => `Profile: ${profile}`,
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',
@@ -2171,6 +2172,7 @@ export const en: Translations = {
       noModel: 'no model',
       switchModel: 'Switch model',
       openModelPicker: 'Open model picker',
+      modelPinned: 'pinned by you; new chats use this instead of the Settings default',
       modelTitle: (provider, model) => `Model · ${provider}: ${model}`,
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }
