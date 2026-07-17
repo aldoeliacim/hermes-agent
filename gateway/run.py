@@ -13629,11 +13629,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the OpenAI function-result shape. Defensive: any parse failure on an
         individual message is skipped, never raised (a bookkeeping scan must
         never break delivery). (2026-07-12 TAMHAL Y JVic double-send fix.)
+
+        CURRENT-TURN SCOPING (2026-07-17 poisoned-history fix): ``agent_messages``
+        is the FULL retained conversation for a long-lived session, not just
+        this turn's tail. A ``send_message success:true`` from ANY earlier turn
+        would otherwise make this scan return True on every subsequent turn,
+        permanently suppressing the real reply as a phantom "duplicate" — the
+        mode-independent DM-silence bug confirmed live on
+        agent:main:whatsapp:dm:5215514706713 (3,455 msgs, 32 stale sends). A
+        gateway turn always begins with the inbound user message, so restrict
+        the scan to messages AFTER the last user-role message: that slice is
+        exactly the model's activity for THIS turn, which is the only window a
+        "already delivered this turn" dedup may legitimately consider.
         """
         import json as _json
         if not agent_messages:
             return False
-        for msg in agent_messages:
+        # Scope to the current turn only: everything after the last user-role
+        # message. Falls back to the whole list if no user message is present
+        # (defensive — preserves prior behavior for that unexpected shape).
+        _turn_start = 0
+        for _i in range(len(agent_messages) - 1, -1, -1):
+            _m = agent_messages[_i]
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _turn_start = _i + 1
+                break
+        for msg in agent_messages[_turn_start:]:
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") != "tool":

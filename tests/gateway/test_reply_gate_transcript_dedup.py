@@ -140,3 +140,91 @@ def test_send_message_target_guidance_discourages_post_send_narration():
     assert "enviado" in lowered or "sent" in lowered
     assert "duplicate" in lowered
 
+
+# --- Current-turn scoping (2026-07-17 poisoned-history regression) ---------
+#
+# CONFIRMED production bug (2026-07-17, WhatsApp DM
+# agent:main:whatsapp:dm:5215514706713, session 20260714_040328_6a7cce):
+# a long-lived DM had 3,455 retained messages including 32 historical
+# send_message success:true results from prior turns. Because the scan
+# received the FULL retained conversation (not just this turn's tail), it
+# returned True on EVERY turn, so _delivered_via_tool was permanently set
+# and every real plain-text reply was suppressed as a phantom duplicate —
+# the user got total silence in their primary channel, mode-independent
+# (reply_gate_mode had no effect because tool_gated was False for the DM;
+# suppression came solely through the dedup guard). Fix: scope the scan to
+# messages after the LAST user-role message (a gateway turn always begins
+# with the inbound user message).
+
+
+def test_stale_prior_turn_send_does_not_dedup_current_turn():
+    """A send_message success from an EARLIER turn (before the last user
+    message) must NOT be treated as this turn's delivery. Otherwise a
+    long-lived session is permanently silenced after its first tool send."""
+    transcript = [
+        # --- prior turn: a real successful send, now stale history ---
+        {"role": "user", "content": "earlier question"},
+        {
+            "role": "tool",
+            "tool_name": "send_message",
+            "content": '{"success": true, "chat_id": "5215514706713@s.whatsapp.net"}',
+        },
+        {"role": "assistant", "content": "earlier reply"},
+        # --- THIS turn: inbound user msg, then only a plain-text answer,
+        #     NO send_message call. Must be delivered, not deduped. ---
+        {"role": "user", "content": "Ya?"},
+        {"role": "assistant", "content": "sí, aquí estoy"},
+    ]
+    assert _scan(transcript) is False
+
+
+def test_current_turn_send_after_last_user_still_dedups():
+    """The legitimate same-turn dedup must still fire: a send in THIS turn
+    (after the last user message) counts, even when stale prior-turn sends
+    also exist in the retained history."""
+    transcript = [
+        {"role": "user", "content": "earlier question"},
+        {
+            "role": "tool",
+            "tool_name": "send_message",
+            "content": '{"success": true, "chat_id": "x@g.us"}',
+        },
+        {"role": "assistant", "content": "earlier reply"},
+        # --- THIS turn: user msg + a real current-turn send ---
+        {"role": "user", "content": "another question"},
+        {
+            "role": "tool",
+            "tool_name": "send_message",
+            "content": '{"success": true, "chat_id": "x@g.us"}',
+        },
+        {"role": "assistant", "content": "trailing narration to dedup"},
+    ]
+    assert _scan(transcript) is True
+
+
+def test_many_stale_sends_then_clean_turn_is_not_deduped():
+    """Direct model of the live incident: many historical successful sends
+    followed by a clean current turn with no send must deliver."""
+    history = []
+    for i in range(32):
+        history.append({"role": "user", "content": f"q{i}"})
+        history.append({
+            "role": "tool",
+            "tool_name": "send_message",
+            "content": '{"success": true, "chat_id": "5215514706713@s.whatsapp.net"}',
+        })
+        history.append({"role": "assistant", "content": f"a{i}"})
+    # current turn: user asks, model answers in plain text, no send
+    history.append({"role": "user", "content": "Ya?"})
+    history.append({"role": "assistant", "content": "aquí estoy"})
+    assert _scan(history) is False
+
+
+def test_no_user_message_falls_back_to_whole_scan():
+    """Defensive: if the transcript somehow has no user-role message, the
+    scan falls back to scanning the whole list (prior behavior), so a send
+    is still detected rather than silently ignored."""
+    msgs = [{"role": "tool", "tool_name": "send_message",
+             "content": '{"success": true}'}]
+    assert _scan(msgs) is True
+
