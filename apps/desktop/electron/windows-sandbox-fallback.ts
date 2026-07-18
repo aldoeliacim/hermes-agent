@@ -5,21 +5,15 @@
  * (`0x80000003` / exit `-2147483645`). Chromium then FATAL-exits
  * ("GPU process isn't usable. Goodbye.") before the UI is usable.
  *
- * Recovery ladder, all scoped to win32:
+ * Two complementary recoveries, both scoped to win32:
  *
- * 1. ACL repair (first line): grant `S-1-15-2-2` (ALL APPLICATION PACKAGES)
- *    RX on the install tree. A missing ACE plus orphan AppContainer SIDs is a
- *    known Chromium CHECK failure (electron/electron#51761). Runs at install
- *    time, and again at launch ONLY when the marker shows a prior aborted
- *    boot — never on healthy launches (icacls /T recursion is not free).
- * 2. `--no-sandbox` (second line): enabled only on strong evidence —
- *    a signature-confirmed GPU/renderer breakpoint death, or TWO consecutive
- *    mid-boot aborts (a single abort can be a task-manager kill or power
- *    loss; the reported failure mode is a deterministic 100% crash loop).
- * 3. The fallback is sticky per app version, not forever: after an update
- *    the sandbox is re-probed once (a new Electron or an installer-applied
- *    ACL grant may have fixed the host). If the re-probe boot aborts, the
- *    next launch goes straight back to `--no-sandbox`.
+ * 1. Grant `S-1-15-2-2` (ALL APPLICATION PACKAGES) RX on the install /
+ *    userData trees. Missing that ACE plus orphan AppContainer SIDs is a
+ *    known Chromium CHECK failure (electron/electron#51761).
+ * 2. Sticky boot marker: write `booting` before sandbox bring-up; clear it
+ *    only on a clean ready. An uncleared marker on the next launch means the
+ *    previous process aborted mid-boot → enable `--no-sandbox` (the only flag
+ *    reporters verified as fully stable for AMD RX 6000 / hybrid GPU hosts).
  *
  * Pure helpers stay injectable so tests never boot Electron or touch real ACLs.
  */
@@ -35,24 +29,10 @@ export const ALL_APPLICATION_PACKAGES_SID = 'S-1-15-2-2'
 /** STATUS_BREAKPOINT as a signed Win32 exit code (WER / Chromium). */
 export const WINDOWS_SANDBOX_BREAKPOINT_EXIT = -2147483645
 
-/** Consecutive mid-boot aborts required before enabling --no-sandbox. */
-export const BOOT_ABORTS_BEFORE_FALLBACK = 2
-
 export type SandboxMarkerState = 'booting' | 'fallback' | 'ok'
-
-export type SandboxFallbackReason = 'gpu-breakpoint' | 'renderer-crash-loop' | 'boot-loop'
 
 export interface SandboxMarker {
   state: SandboxMarkerState
-  /** Why the fallback engaged (state === 'fallback'). */
-  reason?: SandboxFallbackReason
-  /** App version that entered fallback — a version change triggers a re-probe. */
-  version?: string
-  /** Consecutive aborted boots observed so far (state === 'booting'). */
-  bootAborts?: number
-  /** This boot is a sandbox re-probe after an app update; an abort returns
-   *  straight to fallback instead of restarting the two-strike count. */
-  reprobe?: boolean
 }
 
 export function sandboxMarkerPath(userDataDir: string): string {
@@ -67,10 +47,13 @@ export function isWindowsSandboxBreakpointExit(exitCode: unknown): boolean {
   }
 
   // Signed STATUS_BREAKPOINT, or the same 32-bit pattern as unsigned.
-  return n === WINDOWS_SANDBOX_BREAKPOINT_EXIT || n >>> 0 === 0x80000003
+  return n === WINDOWS_SANDBOX_BREAKPOINT_EXIT || (n >>> 0) === 0x80000003
 }
 
-export function alreadyHasNoSandbox(argv: readonly string[] = [], env: NodeJS.ProcessEnv = process.env): boolean {
+export function alreadyHasNoSandbox(
+  argv: readonly string[] = [],
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
   if (Array.isArray(argv) && argv.some(arg => arg === '--no-sandbox')) {
     return true
   }
@@ -82,44 +65,24 @@ export function alreadyHasNoSandbox(argv: readonly string[] = [], env: NodeJS.Pr
   return disable === '1' || disable === 'true' || disable === 'yes' || disable === 'on'
 }
 
-const FALLBACK_REASONS: readonly string[] = ['gpu-breakpoint', 'renderer-crash-loop', 'boot-loop']
-
 export function parseSandboxMarker(raw: unknown): SandboxMarker | null {
   if (!raw || typeof raw !== 'object') {
     return null
   }
 
-  const record = raw as Record<string, unknown>
-  const state = record.state
+  const state = (raw as { state?: unknown }).state
 
-  if (state !== 'booting' && state !== 'fallback' && state !== 'ok') {
-    return null
+  if (state === 'booting' || state === 'fallback' || state === 'ok') {
+    return { state }
   }
 
-  const marker: SandboxMarker = { state }
-
-  if (typeof record.reason === 'string' && FALLBACK_REASONS.includes(record.reason)) {
-    marker.reason = record.reason as SandboxFallbackReason
-  }
-
-  if (typeof record.version === 'string' && record.version) {
-    marker.version = record.version
-  }
-
-  const aborts = Number(record.bootAborts)
-
-  if (Number.isInteger(aborts) && aborts > 0) {
-    marker.bootAborts = aborts
-  }
-
-  if (record.reprobe === true) {
-    marker.reprobe = true
-  }
-
-  return marker
+  return null
 }
 
-export function readSandboxMarker(userDataDir: string, { readFileSync = fs.readFileSync } = {}): SandboxMarker | null {
+export function readSandboxMarker(
+  userDataDir: string,
+  { readFileSync = fs.readFileSync } = {}
+): SandboxMarker | null {
   try {
     const raw = JSON.parse(readFileSync(sandboxMarkerPath(userDataDir), 'utf8'))
 
@@ -150,138 +113,64 @@ export function writeSandboxMarker(
   writeFileSync(sandboxMarkerPath(dir), `${JSON.stringify(marker)}\n`, 'utf8')
 }
 
-export interface SandboxLaunchDecision {
-  enable: boolean
-  reason: string | null
-  /** Marker to persist immediately, before GPU/sandbox children start. */
-  nextMarker: SandboxMarker
-}
-
 /**
- * Single launch-time transition: decide whether this Windows launch disables
- * the Chromium sandbox AND what the marker becomes for crash-detection on the
- * next launch.
+ * Decide whether this Windows launch should disable the Chromium sandbox.
  *
- * - `booting` left behind → the prior launch aborted mid-boot. One abort is
- *   tolerated (could be a kill/power loss); the SECOND consecutive abort — or
- *   a single abort during a post-update re-probe — engages the fallback.
- * - `fallback` is sticky within one app version. A version change re-probes
- *   the sandbox once so a fixed host (new Electron, installer ACL repair)
- *   returns to full sandboxing instead of degrading forever.
- * - A manual `--no-sandbox` / ELECTRON_DISABLE_SANDBOX launch is honored but
- *   NOT made sticky: the marker keeps its normal lifecycle so the flag's
- *   removal restores the sandbox.
+ * `booting` left from a prior launch → previous process aborted before ready.
+ * `fallback` → we already recovered once; keep the workaround sticky so the
+ * Start Menu shortcut does not crash every other launch.
  */
-export function decideWindowsSandboxLaunch(
-  options: {
-    platform?: NodeJS.Platform | string
-    argv?: readonly string[]
-    env?: NodeJS.ProcessEnv
-    marker?: SandboxMarker | null
-    appVersion?: string
-  } = {}
-): SandboxLaunchDecision {
-  const appVersion = String(options.appVersion || '')
-
+export function shouldEnableWindowsNoSandbox(options: {
+  platform?: NodeJS.Platform | string
+  argv?: readonly string[]
+  env?: NodeJS.ProcessEnv
+  marker?: SandboxMarker | null
+} = {}): { enable: boolean; reason: string | null } {
   if ((options.platform ?? process.platform) !== 'win32') {
-    return { enable: false, reason: null, nextMarker: { state: 'booting' } }
+    return { enable: false, reason: null }
   }
 
   const argv = options.argv ?? process.argv
   const env = options.env ?? process.env
-  const marker = options.marker ?? null
 
   if (alreadyHasNoSandbox(argv, env)) {
-    // Honor the explicit flag; keep the marker lifecycle unchanged. When the
-    // relaunch path set the flag, the fallback marker it wrote is preserved.
-    const nextMarker: SandboxMarker = marker?.state === 'fallback' ? marker : { state: 'booting' }
-
-    return { enable: true, reason: 'already-enabled', nextMarker }
+    return { enable: true, reason: 'already-enabled' }
   }
 
-  if (marker?.state === 'fallback') {
-    if (marker.version && appVersion && marker.version !== appVersion) {
-      // App updated since the fallback engaged — re-probe the sandbox once.
-      return {
-        enable: false,
-        reason: null,
-        nextMarker: { state: 'booting', reprobe: true, bootAborts: 0 }
-      }
-    }
+  const state = options.marker?.state
 
-    return {
-      enable: true,
-      reason: 'sticky-fallback',
-      nextMarker: { ...marker, version: marker.version || appVersion || undefined }
-    }
+  if (state === 'booting') {
+    return { enable: true, reason: 'uncleared-boot-marker' }
   }
 
-  if (marker?.state === 'booting') {
-    const abortsObserved = (marker.bootAborts ?? 0) + 1
-
-    if (marker.reprobe) {
-      // The one post-update sandboxed re-probe aborted → back to fallback.
-      return {
-        enable: true,
-        reason: 'reprobe-failed',
-        nextMarker: fallbackMarker('boot-loop', appVersion)
-      }
-    }
-
-    if (abortsObserved >= BOOT_ABORTS_BEFORE_FALLBACK) {
-      return {
-        enable: true,
-        reason: 'boot-loop',
-        nextMarker: fallbackMarker('boot-loop', appVersion)
-      }
-    }
-
-    return {
-      enable: false,
-      reason: null,
-      nextMarker: { state: 'booting', bootAborts: abortsObserved }
-    }
+  if (state === 'fallback') {
+    return { enable: true, reason: 'sticky-fallback' }
   }
 
-  // No marker, or a clean `ok` from the previous run.
-  return { enable: false, reason: null, nextMarker: { state: 'booting' } }
-}
-
-export function fallbackMarker(reason: SandboxFallbackReason, appVersion?: string): SandboxMarker {
-  const marker: SandboxMarker = { state: 'fallback', reason }
-
-  if (appVersion) {
-    marker.version = appVersion
-  }
-
-  return marker
+  return { enable: false, reason: null }
 }
 
 /**
- * After the main window reaches ready-to-show: keep the sticky fallback when
- * we launched with `--no-sandbox`, otherwise mark a clean boot so future
- * launches trust the sandbox again.
+ * Marker to persist immediately after the launch decision, before GPU/sandbox
+ * child processes start. Successful boots rewrite this later.
  */
-export function markerAfterSuccessfulBoot(options: {
-  fallbackActive: boolean
-  reason?: SandboxFallbackReason
-  appVersion?: string
+export function nextSandboxMarkerAfterLaunchDecision(options: {
+  enabledNoSandbox: boolean
 }): SandboxMarker {
-  if (!options.fallbackActive) {
-    return { state: 'ok' }
+  if (options.enabledNoSandbox) {
+    return { state: 'fallback' }
   }
 
-  return fallbackMarker(options.reason ?? 'boot-loop', options.appVersion)
+  return { state: 'booting' }
 }
 
 /**
- * ACL repair is not free (`icacls /T` recurses the whole install tree), so it
- * only runs when there is evidence of trouble: a prior launch aborted
- * mid-boot, or the fallback already engaged. Healthy hosts never pay for it —
- * the installer already granted the ACE at install time.
+ * After the main window reaches ready-to-show: keep sticky fallback when we
+ * launched with `--no-sandbox`, otherwise mark a clean boot so the next
+ * launch can try the sandbox again (e.g. after an ACL grant fixed the host).
  */
-export function shouldAttemptAclRepair(marker: SandboxMarker | null | undefined): boolean {
-  return marker?.state === 'booting' || marker?.state === 'fallback'
+export function markerAfterSuccessfulBoot(options: { fallbackActive: boolean }): SandboxMarker {
+  return options.fallbackActive ? { state: 'fallback' } : { state: 'ok' }
 }
 
 /**
@@ -290,7 +179,14 @@ export function shouldAttemptAclRepair(marker: SandboxMarker | null | undefined)
  * errors; `/Q` stays quiet for installer logs.
  */
 export function buildIcaclsGrantArgs(targetDir: string): string[] {
-  return [String(targetDir), '/grant', `*${ALL_APPLICATION_PACKAGES_SID}:(OI)(CI)(RX)`, '/T', '/C', '/Q']
+  return [
+    String(targetDir),
+    '/grant',
+    `*${ALL_APPLICATION_PACKAGES_SID}:(OI)(CI)(RX)`,
+    '/T',
+    '/C',
+    '/Q'
+  ]
 }
 
 export function grantAllApplicationPackagesAcl(
@@ -354,35 +250,6 @@ export function shouldRelaunchForGpuSandboxCrash(options: {
   }
 
   return isWindowsSandboxBreakpointExit(options.details?.exitCode)
-}
-
-/**
- * True when a renderer crash loop carries the sandbox breakpoint signature
- * and a one-shot `--no-sandbox` relaunch should replace the dead window
- * (#38216 renderer flavor; same recovery as #56726). Gated on the breakpoint
- * exit code so unrelated renderer crash loops (bad extension, OOM churn)
- * don't silently drop the sandbox.
- */
-export function shouldRelaunchForRendererSandboxCrashLoop(options: {
-  platform?: NodeJS.Platform | string
-  reason?: string
-  exitCode?: number | string
-  alreadyNoSandbox?: boolean
-  relaunchAttempted?: boolean
-}): boolean {
-  if ((options.platform ?? process.platform) !== 'win32') {
-    return false
-  }
-
-  if (options.alreadyNoSandbox || options.relaunchAttempted) {
-    return false
-  }
-
-  if (String(options.reason || '') !== 'crashed') {
-    return false
-  }
-
-  return isWindowsSandboxBreakpointExit(options.exitCode)
 }
 
 export function buildNoSandboxRelaunchArgs(argv: readonly string[]): string[] {
