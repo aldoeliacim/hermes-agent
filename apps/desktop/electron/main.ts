@@ -8672,9 +8672,7 @@ function ensureNodePtySpawnHelper() {
       rememberLog(`[terminal] could not chmod spawn-helper ${failure.path}: ${failure.error}`)
     }
   } catch (error) {
-    rememberLog(
-      `[terminal] spawn-helper exec check skipped: ${error instanceof Error ? error.message : String(error)}`
-    )
+    rememberLog(`[terminal] spawn-helper exec check skipped: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
