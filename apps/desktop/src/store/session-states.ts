@@ -30,7 +30,12 @@ import {
 import { readJson, writeJson } from '@/lib/storage'
 
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
-import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds, setActiveSessionStoredId } from './session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  $unreadFinishedSessionIds,
+  setActiveSessionStoredIdRotation
+} from './session'
 import { isSecondaryWindow } from './windows'
 
 // ---------------------------------------------------------------------------
@@ -53,7 +58,10 @@ export function setWatchdogClearFn(fn: WatchdogClearFn | null) {
 function armWatchdog(runtimeId: string) {
   const existing = sessionWatchdogTimers.get(runtimeId)
 
-  if (existing) {clearTimeout(existing)}
+  if (existing) {
+    clearTimeout(existing)
+  }
+
   sessionWatchdogTimers.set(
     runtimeId,
     setTimeout(() => {
@@ -89,8 +97,11 @@ export function getRecentlySettledSessionIds(now: number = Date.now()): string[]
   const live: string[] = []
 
   for (const [id, expiry] of settledExpiry) {
-    if (expiry > now) {live.push(id)}
-    else {settledExpiry.delete(id)}
+    if (expiry > now) {
+      live.push(id)
+    } else {
+      settledExpiry.delete(id)
+    }
   }
 
   return live
@@ -98,19 +109,36 @@ export function getRecentlySettledSessionIds(now: number = Date.now()): string[]
 
 // --- Transition detection (called automatically from publishSessionState) ---
 function handleTransition(previous: ClientSessionState | null, next: ClientSessionState, runtimeId: string) {
-  // Compression id rotation: signal the route-follow effect.
+  // Compression id rotation: signal the route-follow effect with enough
+  // provenance (previous id + runtime) that the consumer can reject the event
+  // if the user navigated elsewhere before React handled it. A bare next id
+  // could let a background session's delayed rotation steal the foreground
+  // route.
   if (previous?.storedSessionId && next.storedSessionId && previous.storedSessionId !== next.storedSessionId) {
-    if (runtimeId === $activeSessionId.get()) {setActiveSessionStoredId(next.storedSessionId)}
+    if (runtimeId === $activeSessionId.get()) {
+      setActiveSessionStoredIdRotation({
+        nextStoredSessionId: next.storedSessionId,
+        previousStoredSessionId: previous.storedSessionId,
+        runtimeSessionId: runtimeId
+      })
+    }
+
     clearSettled(previous.storedSessionId)
   }
 
   // Watchdog: arm on any busy publish, disarm on idle.
-  if (next.busy) {armWatchdog(runtimeId)}
-  else {clearWatchdog(runtimeId)}
+  if (next.busy) {
+    armWatchdog(runtimeId)
+  } else {
+    clearWatchdog(runtimeId)
+  }
 
   const storedId = next.storedSessionId
 
-  if (!storedId) {return}
+  if (!storedId) {
+    return
+  }
+
   const wasWorking = previous?.busy ?? false
 
   if (next.busy && !wasWorking) {
@@ -121,7 +149,9 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     if (storedId !== $selectedStoredSessionId.get()) {
       const cur = $unreadFinishedSessionIds.get()
 
-      if (!cur.includes(storedId)) {$unreadFinishedSessionIds.set([...cur, storedId])}
+      if (!cur.includes(storedId)) {
+        $unreadFinishedSessionIds.set([...cur, storedId])
+      }
     }
   }
 }
