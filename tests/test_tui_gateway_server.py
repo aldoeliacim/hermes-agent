@@ -11,28 +11,30 @@ from unittest.mock import patch
 
 import pytest
 
-# Force a real import of agent.display at module-collection time, before any
-# test in this file gets a chance to patch agent.redact.redact_sensitive_text.
-# agent/display.py does `from agent.redact import redact_sensitive_text` at
-# its own module level — a one-time binding into agent.display's namespace
-# that a later patch of agent.redact's attribute cannot retroactively fix.
-# Two tests below (test_tui_verbose_tool_details_fail_closed_when_redaction_fails,
-# test_tui_verbose_tool_events_omit_details_when_redaction_fails) patch
-# agent.redact.redact_sensitive_text to simulate a redaction failure; without
-# this early import, tui_gateway.server._on_tool_start's lazy
-# `from agent.display import capture_local_edit_snapshot` could trigger
-# agent.display's FIRST-EVER import while the patch is still active, baking
-# the fake fail_redaction permanently into agent.display's namespace and
-# leaking it into every later test in the process that calls
-# agent.display.redact_tool_args_for_display (observed breaking
-# TestConcurrentToolExecution in tests/run_agent/test_run_agent.py when this
-# file ran first in the same pytest session).
-import agent.display  # noqa: F401
-
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
+
+
+@pytest.fixture(autouse=True)
+def _neuter_agent_prewarm_timer(request, monkeypatch):
+    """Stub the deferred agent pre-warm timer for every test in this module.
+
+    ``session.create`` and non-eager ``session.resume`` fire a 50 ms
+    background ``threading.Timer`` (``_schedule_agent_build``) that calls
+    whatever ``server._make_agent`` is patched in AT FIRE TIME. Left live,
+    a timer armed by one test outlives it and lands in the NEXT test's
+    ``_make_agent`` mock, racily corrupting its captured state (the
+    ``'tip' == 'cont_tip'`` flakes in the session_resume tests). Tests that
+    exercise the deferred build itself opt back in with
+    ``@pytest.mark.real_agent_prewarm``.
+    """
+    if request.node.get_closest_marker("real_agent_prewarm"):
+        yield
+        return
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    yield
 
 
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
@@ -760,23 +762,13 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
 
 
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
+    redact_module = types.ModuleType("agent.redact")
+
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
-    # Patch the real agent.redact module's attribute in place (reliably
-    # reverted by monkeypatch) rather than swapping the whole module object
-    # via sys.modules. agent/display.py does `from agent.redact import
-    # redact_sensitive_text` at import time, binding its own private copy of
-    # the name — a sys.modules swap only affects *future* fresh imports, not
-    # that already-bound reference, and (worse) can leave agent.display's
-    # binding pointed at a stale fake module if agent.display happens to get
-    # (re-)imported anywhere while the swap is active, permanently leaking
-    # fail_redaction into every subsequent test in the same process that
-    # exercises redact_tool_args_for_display (e.g. TestConcurrentToolExecution
-    # in tests/run_agent/test_run_agent.py, which calls it via
-    # execute_tool_calls_sequential/get_cute_tool_message_impl and started
-    # failing with this exact RuntimeError once this file ran first).
-    monkeypatch.setattr("agent.redact.redact_sensitive_text", fail_redaction)
+    setattr(redact_module, "redact_sensitive_text", fail_redaction)
+    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
 
     assert server._redact_tui_verbose_text("api_key=secret") == ""
     assert server._tool_args_text({"api_key": "secret"}) == ""
@@ -809,14 +801,13 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
 
 
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
+    redact_module = types.ModuleType("agent.redact")
+
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
-    # See test_tui_verbose_tool_details_fail_closed_when_redaction_fails's
-    # comment: patch the real module attribute in place instead of swapping
-    # sys.modules, which can leak a fake agent.redact module into other
-    # tests/files that import agent.display in the same pytest process.
-    monkeypatch.setattr("agent.redact.redact_sensitive_text", fail_redaction)
+    setattr(redact_module, "redact_sensitive_text", fail_redaction)
+    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
 
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -1455,14 +1446,9 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     monkeypatch.setattr(
         server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None
     )
-    # This resume takes the deferred (non-eager) path, which fires a 50ms
-    # background Timer (`_schedule_agent_build`) that later calls whatever
-    # `server._make_agent` is patched in AT THAT MOMENT. Left un-stubbed, that
-    # timer outlives this test and lands in the *next* test's `_make_agent`
-    # mock, racily corrupting its captured state (the `assert 'tip' ==
-    # 'cont_tip'` flake in test_session_resume_follows_compression_tip). Neuter
-    # the pre-warm here — this test only asserts the returned display history.
-    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    # The deferred pre-warm timer is neutered module-wide by the autouse
+    # _neuter_agent_prewarm_timer fixture; this test only asserts the
+    # returned display history.
 
     resp = server.handle_request(
         {"id": "1", "method": "session.resume", "params": {"session_id": "tip"}}
@@ -1771,6 +1757,18 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert ov["model_override"]["provider"] == "custom:myendpoint"
 
 
+def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
+    overrides = server._stored_session_runtime_overrides(
+        {
+            "model": "gpt-5.4",
+            "model_config": {"service_tier": "normal"},
+        }
+    )
+
+    assert "service_tier_override" in overrides
+    assert overrides["service_tier_override"] == ""
+
+
 def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
     updates = {}
 
@@ -1808,6 +1806,37 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
         },
         "gpt-5.4",
     )
+
+
+def test_persist_live_session_runtime_preserves_explicit_normal_tier():
+    updates = {}
+
+    class FakeDB:
+        def get_session(self, _session_id):
+            return {"model_config": '{"service_tier":"priority"}'}
+
+        def update_session_meta(self, _session_id, model_config_json, model=None):
+            updates["config"] = json.loads(model_config_json)
+
+    agent = types.SimpleNamespace(
+        model="gpt-5.4",
+        provider="openai-codex",
+        base_url=None,
+        api_mode=None,
+        reasoning_config=None,
+        service_tier="",
+        _session_db=FakeDB(),
+    )
+
+    server._persist_live_session_runtime(
+        {
+            "agent": agent,
+            "session_key": "stored-session",
+            "create_service_tier_override": "",
+        }
+    )
+
+    assert updates["config"]["service_tier"] == "normal"
 
 
 def test_status_callback_emits_kind_and_text():
@@ -7147,6 +7176,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_agent_prewarm
 def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     """Regression guard: if session.close runs while session.create's
     _build thread is still constructing the agent, the build thread
@@ -7273,6 +7303,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
 
 
+@pytest.mark.real_agent_prewarm
 def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     """Regression guard: when session.close does NOT race, the build
     thread must install the worker + notify normally and leave them
@@ -7383,6 +7414,7 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
     assert server._db_error == "locking protocol"
 
 
+@pytest.mark.real_agent_prewarm
 def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
     class _FakeWorker:
         def __init__(self, key, model, profile_home=None):
@@ -8370,7 +8402,6 @@ def test_verification_status_outside_workspace_is_not_applicable(monkeypatch, tm
     import agent.coding_context as coding_context
 
     monkeypatch.setattr(coding_context, "project_facts_for", lambda _cwd=None: None)
-
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -10279,8 +10310,16 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         assert resp["result"]["info"]["model"] == "claude-sonnet-4.6"
         assert resp["result"]["info"]["provider"] == "anthropic"
 
+        # Explicit false is not the same as omission: it must suppress a Fast
+        # profile default for this session's first request.
+        normal = server._methods["session.create"](
+            "r2", {"cols": 80, "fast": False}
+        )
+        normal_sess = server._sessions[normal["result"]["session_id"]]
+        assert normal_sess["create_service_tier_override"] == ""
+
         # No knobs → no overrides; the session builds from the profile default.
-        plain = server._methods["session.create"]("r2", {"cols": 80})
+        plain = server._methods["session.create"]("r3", {"cols": 80})
         plain_sess = server._sessions[plain["result"]["session_id"]]
         assert plain_sess["model_override"] is None
         assert plain_sess["create_reasoning_override"] is None
@@ -10289,7 +10328,10 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         server._sessions.clear()
 
 
-def test_start_agent_build_passes_session_model_override(monkeypatch):
+@pytest.mark.parametrize("service_tier_override", ["priority", ""])
+def test_start_agent_build_passes_session_model_override(
+    monkeypatch, service_tier_override
+):
     """A model staged on the session (e.g. by session.create from the desktop
     composer) must reach _make_agent so the first build runs on it directly —
     no global config, no build-then-switch.
@@ -10329,7 +10371,7 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
         "profile_home": None,
         "model_override": override,
         "create_reasoning_override": reasoning,
-        "create_service_tier_override": "priority",
+        "create_service_tier_override": service_tier_override,
     }
     server._sessions[sid] = session
     try:
@@ -10337,12 +10379,281 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
         assert session["agent_ready"].wait(timeout=3), "agent build did not finish"
         assert captured.get("model_override") == override
         assert captured.get("reasoning_config_override") == reasoning
-        assert captured.get("service_tier_override") == "priority"
+        assert captured.get("service_tier_override") == service_tier_override
         assert session["agent"].model == "claude-sonnet-4.6"
     finally:
         server._sessions.clear()
 
 
+# ── billing/subscription state + error serialization ─────────────────
+
+
+def test_reset_session_agent_preserves_explicit_normal_fast(monkeypatch):
+    captured = {}
+    new_agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier="")
+    session = _session(
+        agent=types.SimpleNamespace(
+            model="openai/gpt-5.4",
+            reasoning_config=None,
+            service_tier="",
+        ),
+        model_override={"model": "openai/gpt-5.4"},
+        create_service_tier_override="",
+    )
+
+    def make_agent(*_args, **kwargs):
+        captured.update(kwargs)
+        return new_agent
+
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: True)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+
+    server._reset_session_agent("sid", session)
+
+    assert captured["service_tier_override"] == ""
+    assert session["agent"] is new_agent
+
+
+@pytest.mark.parametrize(
+    "card,expected",
+    [
+        ("canonical", {"kind": "canonical"}),
+        (
+            "distinct",
+            {
+                "kind": "distinct",
+                "payment_method_id": "pm_auto",
+                "brand": None,
+                "last4": None,
+            },
+        ),
+        ("none", {"kind": "none"}),
+    ],
+)
+def test_billing_state_serializes_auto_reload_card_union(monkeypatch, card, expected):
+    from agent.billing_view import AutoReload, AutoReloadCard, BillingState
+
+    monkeypatch.setattr(server, "_usage_payload", lambda state: {"available": False})
+    auto_reload_card = AutoReloadCard(
+        kind=card,
+        payment_method_id="pm_auto" if card == "distinct" else None,
+    )
+    state = BillingState(
+        logged_in=True,
+        auto_reload=AutoReload(enabled=True, card=auto_reload_card),
+    )
+
+    result = server._serialize_billing_state(state)
+
+    assert result["auto_reload"]["card"] == expected
+
+
+def test_billing_state_serializes_server_plan_capability(monkeypatch):
+    from agent.billing_view import BillingState
+
+    monkeypatch.setattr(server, "_usage_payload", lambda state: {"available": False})
+    state = BillingState(
+        logged_in=True,
+        role="MEMBER",
+        can_change_plan_raw=True,
+    )
+
+    result = server._serialize_billing_state(state)
+
+    assert result["is_admin"] is False
+    assert result["can_change_plan"] is True
+
+
+class _BillingHeaders:
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, key):
+        return self._values.get(key)
+
+
+@pytest.mark.parametrize(
+    "status,error,retry_after",
+    [
+        (503, "stripe_unavailable", 75),
+        (429, "upgrade_cap_exceeded", None),
+        (429, "rate_limited", None),
+    ],
+)
+def test_billing_error_serialization_preserves_server_code(
+    status, error, retry_after
+):
+    import hermes_cli.nous_billing as nb
+
+    headers = _BillingHeaders({"Retry-After": str(retry_after)}) if retry_after else None
+    with pytest.raises(nb.BillingTransient) as ei:
+        nb._raise_for_error(status, {"error": error}, headers)
+
+    result = server._serialize_billing_error(ei.value)
+
+    assert result["error"] == error
+    assert ei.value.error == error
+    assert result["retry_after"] == retry_after
+
+
+def test_billing_rate_limit_without_error_defaults_wire_code():
+    import hermes_cli.nous_billing as nb
+
+    exc = nb.BillingRateLimited("slow down", status=429, retry_after=10)
+
+    result = server._serialize_billing_error(exc)
+
+    assert result["error"] == "rate_limited"
+
+
+# ── subscription change RPCs (V3): preview + pending-change + upgrade ──
+
+
+def _sub_rpc(method, params):
+    # These RPCs are in _LONG_HANDLERS (pool-routed → dispatch returns None and the
+    # worker writes via the transport), so drive the inline handler directly.
+    return server.handle_request({"id": "1", "method": method, "params": params})["result"]
+
+
+def test_subscription_preview_serializes_quote(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    monkeypatch.setattr(
+        nb,
+        "post_subscription_preview",
+        lambda subscription_type_id: {
+            "effect": "charge_now",
+            "reason": None,
+            "currentTierId": "plus",
+            "currentTierName": "Plus",
+            "targetTierId": "ultra",
+            "targetTierName": "Ultra",
+            "monthlyCreditsDelta": "6000",
+            "amountDueNowCents": 1234,
+            "effectiveAt": None,
+        },
+    )
+    res = _sub_rpc("subscription.preview", {"subscription_type_id": "ultra"})
+    assert res["ok"] is True
+    assert res["effect"] == "charge_now"
+    assert res["amount_due_now_cents"] == 1234
+    assert res["target_tier_name"] == "Ultra"
+    assert res["monthly_credits_delta"] == "6000"
+
+
+def test_subscription_preview_requires_tier():
+    res = _sub_rpc("subscription.preview", {})
+    assert res["ok"] is False
+    assert res["error"] == "invalid_request"
+
+
+def test_subscription_preview_scope_error_maps_to_step_up(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    def _raise(subscription_type_id):
+        raise nb.BillingScopeRequired("billing:manage required")
+
+    monkeypatch.setattr(nb, "post_subscription_preview", _raise)
+    res = _sub_rpc("subscription.preview", {"subscription_type_id": "ultra"})
+    assert res["ok"] is False
+    assert res["error"] == "insufficient_scope"
+
+
+def test_subscription_change_cancellation(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    seen = {}
+
+    def _put(*, subscription_type_id=None, cancel=False):
+        seen["tier"] = subscription_type_id
+        seen["cancel"] = cancel
+        return {"rail": "stripe", "cancelAtPeriodEnd": True, "message": "Scheduled to cancel."}
+
+    monkeypatch.setattr(nb, "put_subscription_pending_change", _put)
+    res = _sub_rpc("subscription.change", {"cancel": True})
+    assert res["ok"] is True
+    assert seen == {"tier": None, "cancel": True}
+    assert res["message"] == "Scheduled to cancel."
+
+
+def test_subscription_change_tier_downgrade(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    seen = {}
+
+    def _put(*, subscription_type_id=None, cancel=False):
+        seen["tier"] = subscription_type_id
+        seen["cancel"] = cancel
+        return {"rail": "stripe", "changeType": "downgrade", "targetTierName": "Plus", "message": "Scheduled."}
+
+    monkeypatch.setattr(nb, "put_subscription_pending_change", _put)
+    res = _sub_rpc("subscription.change", {"subscription_type_id": "plus"})
+    assert res["ok"] is True
+    assert seen == {"tier": "plus", "cancel": False}
+
+
+def test_subscription_change_requires_tier_or_cancel():
+    res = _sub_rpc("subscription.change", {})
+    assert res["ok"] is False
+    assert res["error"] == "invalid_request"
+
+
+def test_subscription_resume(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    monkeypatch.setattr(
+        nb,
+        "delete_subscription_pending_change",
+        lambda: {"rail": "stripe", "cancelAtPeriodEnd": False, "message": "Resumed."},
+    )
+    res = _sub_rpc("subscription.resume", {})
+    assert res["ok"] is True
+    assert res["message"] == "Resumed."
+
+
+def test_subscription_upgrade_echoes_status_and_idempotency(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    seen = {}
+
+    def _upgrade(*, subscription_type_id, idempotency_key):
+        seen["key"] = idempotency_key
+        return {"status": "upgraded", "targetTierId": "ultra", "targetTierName": "Ultra"}
+
+    monkeypatch.setattr(nb, "post_subscription_upgrade", _upgrade)
+    res = _sub_rpc("subscription.upgrade", {"subscription_type_id": "ultra", "idempotency_key": "k-1"})
+    assert res["ok"] is True
+    assert res["status"] == "upgraded"
+    assert res["target_tier_name"] == "Ultra"
+    assert res["idempotency_key"] == "k-1"
+    assert seen["key"] == "k-1"
+
+
+def test_subscription_upgrade_requires_action_surfaces_recovery(monkeypatch):
+    import hermes_cli.nous_billing as nb
+
+    monkeypatch.setattr(
+        nb,
+        "post_subscription_upgrade",
+        lambda *, subscription_type_id, idempotency_key: {
+            "status": "requires_action",
+            "reason": "authentication_required",
+            "recoveryUrl": "https://portal.example/subscription?org_id=o",
+        },
+    )
+    res = _sub_rpc("subscription.upgrade", {"subscription_type_id": "ultra"})
+    # The RPC succeeds; the CHARGE needs 3DS → status + recovery_url for the portal.
+    assert res["ok"] is True
+    assert res["status"] == "requires_action"
+    assert res["recovery_url"].startswith("https://portal.example")
+    assert res["idempotency_key"]  # minted when the caller omits one
 # ── _get_usage active_subagents (TUI status-bar ⛓ indicator) ──────────────
 # Mirrors the classic CLI status bar: _get_usage embeds a live count of
 # background/async subagents from tools.async_delegation.active_count() so the
@@ -10470,8 +10781,12 @@ class TestResolveRuntimeWithFallback:
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             lambda **kw: expected,
         )
-        result = server._resolve_runtime_with_fallback({"requested": "openai"})
-        assert result == expected
+        resolution = server._resolve_runtime_with_fallback(
+            {"requested": "openai"}
+        )
+        assert resolution.runtime == expected
+        assert resolution.selected_model is None
+        assert resolution.used_fallback is False
 
     def test_auth_error_tries_fallback_chain(self, monkeypatch):
         """On AuthError from primary, walk fallback_providers chain."""
@@ -10493,10 +10808,47 @@ class TestResolveRuntimeWithFallback:
             "_load_fallback_model",
             lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
         )
-        result = server._resolve_runtime_with_fallback(
+        resolution = server._resolve_runtime_with_fallback(
             {"requested": "openai-codex"},
         )
-        assert result == fallback_runtime
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "deepseek-v4-pro"
+        assert resolution.used_fallback is True
+
+    def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
+        """Auth fallback requires one complete provider/model pair."""
+        from hermes_cli.auth import AuthError
+
+        requested = []
+        fallback_runtime = {"provider": "openrouter", "api_key": "fb-tok"}
+
+        def fake_resolve(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") == "openai-codex":
+                raise AuthError("No Codex credentials stored")
+            return fallback_runtime
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [
+                {"provider": "anthropic"},
+                {"provider": "openrouter", "model": "z-ai/glm-5.2"},
+            ],
+        )
+
+        resolution = server._resolve_runtime_with_fallback(
+            {"requested": "openai-codex"}
+        )
+
+        assert requested == ["openai-codex", "openrouter"]
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "z-ai/glm-5.2"
+        assert resolution.used_fallback is True
 
     def test_fallback_entry_key_env_resolves_api_key(self, monkeypatch):
         """A fallback entry naming its key via key_env passes the resolved
@@ -10580,10 +10932,12 @@ class TestResolveRuntimeWithFallback:
                 {"provider": "anthropic", "model": "claude-sonnet-4-6"},
             ],
         )
-        result = server._resolve_runtime_with_fallback(
+        resolution = server._resolve_runtime_with_fallback(
             {"requested": "openai-codex"},
         )
-        assert result == fallback_runtime
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "claude-sonnet-4-6"
+        assert resolution.used_fallback is True
 
     def test_make_agent_uses_fallback_on_auth_error(self, monkeypatch):
         """Integration: _make_agent falls back to configured fallback
@@ -10593,10 +10947,14 @@ class TestResolveRuntimeWithFallback:
         from hermes_cli.auth import AuthError
 
         captured = {}
-        fallback_runtime = {"provider": "deepseek", "api_key": "fb-tok"}
+        fallback_runtime = {
+            "provider": "deepseek",
+            "api_key": "fb-tok",
+            "base_url": "https://fallback.invalid/v1",
+        }
 
         def fake_resolve(**kwargs):
-            if kwargs.get("requested") == "openai-codex":
+            if kwargs.get("requested") in (None, "openai-codex"):
                 raise AuthError("No Codex credentials stored")
             return fallback_runtime
 
@@ -10625,10 +10983,21 @@ class TestResolveRuntimeWithFallback:
         monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
         monkeypatch.setattr(server, "_get_db", lambda: None)
 
-        agent = server._make_agent("sid", "session-key")
+        agent = server._make_agent(
+            "sid",
+            "session-key",
+            model_override={
+                "model": "gpt-5.5",
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "stale-codex-token",
+            },
+        )
 
-        assert agent.model == "gpt-5.5"
+        assert agent.model == "deepseek-v4-pro"
         assert captured["provider"] == "deepseek"
+        assert captured["base_url"] == "https://fallback.invalid/v1"
+        assert captured["api_key"] == "fb-tok"
 
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():
