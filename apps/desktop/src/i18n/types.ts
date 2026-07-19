@@ -707,6 +707,8 @@ export interface Translations {
       noProviderOptions: string
       noProviders: string
       ready: string
+      needsSignIn: string
+      needsSetup: string
       nousIncluded: string
       noApiKeyRequired: string
       postSetupHint: (step: string) => string
