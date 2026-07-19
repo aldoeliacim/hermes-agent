@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url'
 
 import { withCpuProfile } from './lib/cdp.mjs'
 import { compareScenario, loadBaseline, updateBaseline } from './lib/baseline.mjs'
-import { attach, buildProdRenderer, coldStartSamples, startIsolatedInstance } from './lib/launch.mjs'
+import { attach, buildProdRenderer, startIsolatedInstance } from './lib/launch.mjs'
 import { cpuProfileTopSelf, median } from './lib/stats.mjs'
 import { CI_SCENARIOS, SCENARIOS } from './scenarios/index.mjs'
 
@@ -149,11 +149,16 @@ async function main() {
       process.exit(2)
     }
 
-    // Representative WARM-cache samples (see coldStartSamples). Pass --cold-fresh
-    // to instead measure the worst-case first-launch (cold code cache).
-    const perRun = await coldStartSamples({ runs, port, devPort, prod, warm: !('cold-fresh' in flags) })
+    const perRun = []
 
-    record('cold-start', 'cold', medianMetrics(perRun), { runs, warm: !('cold-fresh' in flags) })
+    for (let i = 0; i < runs; i++) {
+      const inst = await startIsolatedInstance({ port, devPort, prod, coldStart: true })
+      const t = inst.timings
+      perRun.push({ spawn_to_cdp_ms: t.spawn_to_cdp_ms, spawn_to_driver_ms: t.spawn_to_driver_ms, fcp_ms: t.fcp_ms })
+      inst.teardown()
+    }
+
+    record('cold-start', 'cold', medianMetrics(perRun), { runs })
   }
 
   // Steady-state scenarios share one persistent connection.

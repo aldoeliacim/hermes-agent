@@ -170,6 +170,7 @@ export async function startIsolatedInstance({
   hermesHome,
   userDataDir,
   seedConfig = true,
+  bootFakeStepMs = 120,
   settleMs = 2500,
   connectTimeoutMs = 90000
 } = {}) {
@@ -231,13 +232,11 @@ export async function startIsolatedInstance({
     // Isolated Electron: own --user-data-dir (single-instance lock scope) + own
     // HERMES_HOME (backend + sessions). No DEV_SERVER env in prod → dist load.
     const electronBin = require('electron')
-    // NB: do NOT set HERMES_DESKTOP_BOOT_FAKE here — it injects artificial
-    // per-phase sleeps into the boot overlay, which inflates cold-start timing
-    // (and adds pointless startup latency to the steady-state runs). We want the
-    // real boot sequence.
     const env = {
       ...process.env,
       HERMES_HOME: home,
+      HERMES_DESKTOP_BOOT_FAKE: '1',
+      HERMES_DESKTOP_BOOT_FAKE_STEP_MS: String(bootFakeStepMs),
       XCURSOR_SIZE: '24'
     }
 
@@ -326,65 +325,6 @@ export async function startIsolatedInstance({
   }
 }
 
-// Representative cold-start sampling. A fresh --user-data-dir means a COLD V8
-// code cache and worst-case bundle recompile every run (~+400ms measured); real
-// users reuse their profile, so a warm cache is the representative case. We reuse
-// ONE profile across runs: run 0 warms the cache (discarded), runs 1..N are the
-// warm samples. Each run steps the port so a just-killed instance can't be
-// re-attached, and we pause between runs so the single-instance lock releases.
-export async function coldStartSamples({ runs = 3, port = 9222, devPort = 5174, prod = false, warm = true } = {}) {
-  const pickNumeric = timings => Object.fromEntries(Object.entries(timings).filter(([, v]) => typeof v === 'number'))
-  const samples = []
-
-  if (warm) {
-    // Shared profile across runs: run 0 warms the V8 code cache (discarded),
-    // runs 1..N are the representative warm samples.
-    const home = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-home-'))
-    const userDataDir = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-ud-'))
-    seedConfigFrom(join(homedir(), '.hermes'), home)
-
-    try {
-      for (let i = 0; i <= runs; i++) {
-        const inst = await startIsolatedInstance({
-          port: port + i,
-          devPort: devPort + i,
-          prod,
-          coldStart: true,
-          hermesHome: home,
-          userDataDir,
-          seedConfig: false
-        })
-
-        if (i > 0) {
-          samples.push(pickNumeric(inst.timings))
-        }
-
-        inst.teardown()
-        await sleep(2500) // let the single-instance lock release before reuse
-      }
-    } finally {
-      for (const dir of [home, userDataDir]) {
-        try {
-          rmSync(dir, { recursive: true, force: true })
-        } catch {
-          // best-effort
-        }
-      }
-    }
-  } else {
-    // Worst case: a fresh profile per run → cold code cache every launch
-    // (first-launch-after-install). startIsolatedInstance makes+removes its dirs.
-    for (let i = 0; i < runs; i++) {
-      const inst = await startIsolatedInstance({ port: port + i, devPort: devPort + i, prod, coldStart: true })
-      samples.push(pickNumeric(inst.timings))
-      inst.teardown()
-      await sleep(2500)
-    }
-  }
-
-  return samples
-}
-
 // Read First Contentful Paint + time-to-composer from the renderer, relative to
 // its navigation start (the process-spawn deltas live in `timings`).
 async function readBootMarks(cdp) {
@@ -392,26 +332,17 @@ async function readBootMarks(cdp) {
     return await cdp.eval(`(() => {
       const paints = performance.getEntriesByType('paint')
       const fcp = paints.find(p => p.name === 'first-contentful-paint')
-      const nav = performance.getEntriesByType('navigation')[0]
       const composer = document.querySelector('[data-slot="composer-rich-input"]')
-      // Largest script resource ≈ the (intentionally single) renderer bundle.
-      // responseEnd → the script's own decode; the eval cost shows up as the gap
-      // between the bundle's responseEnd and domInteractive.
-      const scripts = performance.getEntriesByType('resource').filter(r => r.initiatorType === 'script')
-      const mainScript = scripts.sort((a, b) => (b.encodedBodySize || 0) - (a.encodedBodySize || 0))[0]
-      const round = n => (typeof n === 'number' ? Math.round(n) : null)
       return {
-        fcp_ms: fcp ? round(fcp.startTime) : null,
-        dom_interactive_ms: nav ? round(nav.domInteractive) : null,
-        dom_content_loaded_ms: nav ? round(nav.domContentLoadedEventEnd) : null,
-        main_script_kb: mainScript ? round((mainScript.encodedBodySize || 0) / 1024) : null,
-        main_script_response_end_ms: mainScript ? round(mainScript.responseEnd) : null,
-        nav_to_read_ms: round(performance.now()),
+        fcp_ms: fcp ? Math.round(fcp.startTime) : null,
+        // performance.now() at read time ≈ time since nav start; only meaningful
+        // right after boot (cold-start reads it immediately).
+        nav_to_read_ms: Math.round(performance.now()),
         composer_present: !!composer
       }
     })()`)
   } catch {
-    return { fcp_ms: null, dom_interactive_ms: null, composer_present: false }
+    return { fcp_ms: null, nav_to_read_ms: null, composer_present: false }
   }
 }
 
