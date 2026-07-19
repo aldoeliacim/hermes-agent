@@ -1948,7 +1948,7 @@ class AIAgent:
                     _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
-# (never to the live dict). A multimodal override is a complete
+                # (never to the live dict). A multimodal override is a complete
                 # clean replacement for an API-local noted payload. Preserve the
                 # historical text-only guard for a list payload, though: a plain
                 # text override must not erase its image/audio transcript summary.
