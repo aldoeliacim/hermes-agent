@@ -324,11 +324,24 @@ class TestSendMessageTool:
         config, _telegram_cfg = _make_config()
         config.get_home_channel = lambda _platform: home
 
+        # Hermeticity: the cron auto-delivery target is resolved via
+        # get_session_env, which consults the HERMES_CRON_AUTO_DELIVER_*
+        # ContextVars BEFORE os.environ. A prior test in the same worker can
+        # leave those vars set (to "" or a stale value), which then shadows the
+        # os.environ we patch below and makes _get_cron_auto_delivery_target
+        # mis-resolve (observed: a leaked THREAD_ID != our None -> same_target
+        # False -> no skip). Restore them to the "never set" (_UNSET) sentinel
+        # so the os.environ fallback below is authoritative, and pin THREAD_ID
+        # explicitly so an ambient value can never break the target match.
+        from gateway.session_context import reset_cron_delivery_vars
+        reset_cron_delivery_vars()
+
         with patch.dict(
             os.environ,
             {
                 "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
                 "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
+                "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "",
             },
             clear=False,
         ), \
