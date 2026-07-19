@@ -44,26 +44,37 @@ export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem
 // $backgroundStatusBySession is keyed by RUNTIME session id (gateway events
 // and process.list both speak that); the sidebar row knows only the STORED id.
 // $sessionStates bridges the two: runtime id → state.storedSessionId.
-export const $backgroundRunningSessionIds = computed(
-  [$backgroundStatusBySession, $sessionStates],
-  (bg, states) => {
-    const ids = new Set<string>()
+// Perf: this recomputes whenever $sessionStates changes (every message delta,
+// tens/sec during a turn), but the background-running set changes rarely.
+// Returning a fresh array each time re-renders every sidebar row that reads it;
+// hand back the previous reference when the set is unchanged so nanostores skips
+// the notify.
+let backgroundRunningCache: string[] = []
+export const $backgroundRunningSessionIds = computed([$backgroundStatusBySession, $sessionStates], (bg, states) => {
+  const ids = new Set<string>()
 
-    for (const [runtimeId, items] of Object.entries(bg)) {
-      if (!items.some(i => i.state === 'running')) {
-        continue
-      }
-
-      const storedId = states[runtimeId]?.storedSessionId
-
-      if (storedId) {
-        ids.add(storedId)
-      }
+  for (const [runtimeId, items] of Object.entries(bg)) {
+    if (!items.some(i => i.state === 'running')) {
+      continue
     }
 
-    return [...ids]
+    const storedId = states[runtimeId]?.storedSessionId
+
+    if (storedId) {
+      ids.add(storedId)
+    }
   }
-)
+
+  const next = [...ids]
+
+  if (next.length === backgroundRunningCache.length && next.every((id, i) => id === backgroundRunningCache[i])) {
+    return backgroundRunningCache
+  }
+
+  backgroundRunningCache = next
+
+  return next
+})
 
 // Rows the user X-ed away. The registry keeps finished processes around for a
 // while, so without this every refresh would resurrect a dismissed row.
