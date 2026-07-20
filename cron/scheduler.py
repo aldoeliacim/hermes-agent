@@ -140,6 +140,60 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _cron_error_control_channel() -> Optional[str]:
+    """Return the operator's control channel for cron FAILURE alerts, or None.
+
+    Failure alerts must never spam a third party's chat (the origin chat of a
+    job created from a contact's conversation).  When set, ``cron.error_channel``
+    in config.yaml (e.g. ``telegram:938650296:47593``) receives all failure
+    notifications instead of the job's normal delivery target.  Falls back to
+    the first configured Telegram home channel so a misconfigured job cannot
+    leak provider/timeout noise to a contact.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return None
+    explicit = (cfg.get("cron", {}) or {}).get("error_channel")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    # Fallback: first Telegram home channel (operator's own chat).
+    try:
+        home = (cfg.get("home_channels", {}) or {})
+        tg = home.get("telegram")
+        if isinstance(tg, dict):
+            chat_id = tg.get("chat_id") or tg.get("id")
+            if chat_id:
+                thread = tg.get("thread_id")
+                return f"telegram:{chat_id}:{thread}" if thread else f"telegram:{chat_id}"
+        elif isinstance(tg, str) and tg.strip():
+            return f"telegram:{tg.strip()}"
+    except Exception:
+        pass
+    return None
+
+
+def _redirect_failure_delivery(job: dict) -> Optional[dict]:
+    """If a FAILED job's normal target is a third-party chat, return a shallow
+    copy of the job whose ``deliver`` points at the operator control channel.
+
+    Returns None when no redirect is needed (no control channel configured, or
+    the job already delivers to the operator).  This keeps SUCCESS deliveries
+    untouched — only failure noise is rerouted so contacts never see
+    "⚠️ Cron failed: provider timeout" spam (the tr3/Melissa incident).
+    """
+    control = _cron_error_control_channel()
+    if not control:
+        return None
+    redirected = dict(job)
+    redirected["deliver"] = control
+    # Drop the captured origin so _resolve_single_delivery_target uses the
+    # explicit control channel, not the job's original contact chat.
+    redirected.pop("origin", None)
+    redirected.pop("delivery", None)
+    return redirected
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -3803,8 +3857,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 should_deliver = False
 
             if should_deliver:
+                # Route FAILURE alerts to the operator's control channel instead
+                # of the job's normal target, so a job created from a contact's
+                # chat never spams that contact with provider/timeout errors
+                # (the tr3-latino-rip-watcher / Melissa incident). Success
+                # deliveries are untouched.
+                delivery_job = job
+                if not success:
+                    _redirected = _redirect_failure_delivery(job)
+                    if _redirected is not None:
+                        delivery_job = _redirected
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(delivery_job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

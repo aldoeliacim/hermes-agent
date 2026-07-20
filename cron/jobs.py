@@ -1540,6 +1540,41 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+
+                # Consecutive-failure tracking → auto-pause runaway jobs.
+                # A job that fails every fire (bad script path, dead provider,
+                # broken SSH target) otherwise keeps firing forever and, if it
+                # delivers to a chat, spams it each time (the tr3/Melissa
+                # incident: failed every 6 min for hours). After a threshold of
+                # back-to-back failures we auto-pause so a broken job goes quiet
+                # instead of hammering. Reset the counter on any success.
+                if success:
+                    job["consecutive_failures"] = 0
+                else:
+                    job["consecutive_failures"] = int(job.get("consecutive_failures", 0)) + 1
+                    try:
+                        from hermes_cli.config import load_config
+                        _cfg = load_config() or {}
+                        _threshold = int(
+                            (_cfg.get("cron", {}) or {}).get("auto_pause_after_failures", 5)
+                        )
+                    except Exception:
+                        _threshold = 5
+                    if _threshold > 0 and job["consecutive_failures"] >= _threshold:
+                        job["enabled"] = False
+                        job["state"] = "paused"
+                        job["paused_at"] = now
+                        job["paused_reason"] = (
+                            f"auto-paused after {job['consecutive_failures']} "
+                            f"consecutive failures (last: {str(error)[:100]})"
+                        )
+                        logger.warning(
+                            "Job '%s' auto-paused after %d consecutive failures",
+                            job.get("name", job_id), job["consecutive_failures"],
+                        )
+                        save_jobs(jobs)
+                        return
+
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
