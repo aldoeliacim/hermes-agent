@@ -413,6 +413,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           const text = coerceGatewayText(payload?.text)
+
           if (text) {
             finalizeInterimAssistantMessage(sessionId, text)
           }
